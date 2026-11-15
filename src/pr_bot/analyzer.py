@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import tempfile
@@ -15,6 +16,8 @@ from pydantic import BaseModel, Field
 from indexer.models import ASTChunkNode, CPGEdgeKind, IRStatus, Language, UnifiedCodeUnit
 from mcp_server.code_index_server import CodeIndexPipeline
 from storage.hybrid_store import compute_wl_ir_vector, cosine_similarity
+
+logger = logging.getLogger(__name__)
 
 _DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -245,21 +248,27 @@ class RepoReviewReport(BaseModel):
             "",
         ]
         if self.delta_summary:
-            new_h = self.delta_summary.get("new_hotspots", [])
-            worsened = self.delta_summary.get("worsened_hotspots", [])
-            resolved = self.delta_summary.get("resolved_hotspots", [])
             lines.extend(["### Changes Since Last Run", ""])
-            lines.append(
-                f"- **New Hotspots:** {len(new_h)} | "
-                f"**Worsened:** {len(worsened)} | "
-                f"**Resolved:** {len(resolved)}"
-            )
-            for item in new_h[:10]:
-                lines.append(f"  - `[NEW]` `{item['key']}` (CC={item['complexity']})")
-            for item in worsened[:10]:
+            if "baseline_error" in self.delta_summary:
                 lines.append(
-                    f"  - `[WORSENED]` `{item['key']}` (CC {item['before']} -> {item['after']})"
+                    f"- **Baseline Warning:** Failed to load baseline "
+                    f"({self.delta_summary['baseline_error']})"
                 )
+            else:
+                new_h = self.delta_summary.get("new_hotspots", [])
+                worsened = self.delta_summary.get("worsened_hotspots", [])
+                resolved = self.delta_summary.get("resolved_hotspots", [])
+                lines.append(
+                    f"- **New Hotspots:** {len(new_h)} | "
+                    f"**Worsened:** {len(worsened)} | "
+                    f"**Resolved:** {len(resolved)}"
+                )
+                for item in new_h[:10]:
+                    lines.append(f"  - `[NEW]` `{item['key']}` (CC={item['complexity']})")
+                for item in worsened[:10]:
+                    lines.append(
+                        f"  - `[WORSENED]` `{item['key']}` (CC {item['before']} -> {item['after']})"
+                    )
             lines.append("")
 
         if self.degraded_details:
@@ -531,6 +540,20 @@ def analyze_pr_directories(
     )
 
 
+def resolve_merge_base(repo: Path, base_ref: str, head_ref: str) -> str:
+    """Resolve the merge-base of base_ref and head_ref, falling back to base_ref."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", base_ref, head_ref],
+        shell=False,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    return base_ref
+
+
 def analyze_git_pr(
     repo_path: str | Path,
     base_ref: str = "HEAD~1",
@@ -539,8 +562,9 @@ def analyze_git_pr(
 ) -> PRReviewReport:
     """Run base-vs-head 4-layer PR analysis using isolated git worktrees."""
     repo = Path(repo_path).resolve()
+    effective_base = resolve_merge_base(repo, base_ref, head_ref)
     diff_proc = subprocess.run(
-        ["git", "-C", str(repo), "diff", "-U0", base_ref, head_ref],
+        ["git", "-C", str(repo), "diff", "-U0", effective_base, head_ref],
         shell=False,
         capture_output=True,
         text=True,
@@ -548,11 +572,11 @@ def analyze_git_pr(
     )
     cc_path = Path(compile_commands_path) if compile_commands_path else None
 
-    with tempfile.TemporaryDirectory(prefix="ag-pr-") as tmp_root:
+    with tempfile.TemporaryDirectory(prefix="astraea-pr-") as tmp_root:
         base_wt = Path(tmp_root) / "base"
         head_wt = Path(tmp_root) / "head"
         subprocess.run(
-            ["git", "-C", str(repo), "worktree", "add", "--detach", str(base_wt), base_ref],
+            ["git", "-C", str(repo), "worktree", "add", "--detach", str(base_wt), effective_base],
             shell=False,
             capture_output=True,
             check=True,
@@ -636,8 +660,9 @@ def _compute_baseline_delta(
         return {}
     try:
         prev_data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to load baseline JSON from %s: %s", path, exc)
+        return {"baseline_error": str(exc)}
 
     prev_hotspots: dict[str, int] = {
         str(k): int(v) for k, v in (prev_data.get("hotspots") or {}).items()

@@ -18,7 +18,7 @@ ALLOWED_CLANG_PREFIXES: tuple[str, ...] = ("-I", "-isystem", "-D", "-U", "-std="
 MAX_GRAPH_NODES: int = 10_000
 MAX_COMPILER_TIMEOUT_S: float = 15.0
 MAX_COMPILER_MEMORY_BYTES: int = 2 * 1024 * 1024 * 1024  # 2 GB
-BUILD_TMP_ROOT = Path("/tmp/ag-index-build")
+BUILD_TMP_ROOT = Path("/tmp/astraea-index-build")
 
 _SSA_REG_RE = re.compile(r"%([A-Za-z0-9_.$-]+)")
 _DBG_REF_RE = re.compile(r"!dbg\s+!(\d+)")

@@ -8,8 +8,11 @@ from pathlib import Path
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from indexer.ast_chunker import ASTChunker
 from indexer.binary_lifter import BinaryLifter
+from indexer.llvm_ir_pass import BUILD_TMP_ROOT
 from indexer.models import IRStatus
+from indexer.semantic_cpg import SemanticCPGBuilder
 from mcp_server.code_index_server import CodeIndexPipeline, mcp
 
 
@@ -58,6 +61,44 @@ def test_e2e01_pipeline_indexing_and_degraded_fallback(tmp_path: Path) -> None:
     # Broken C file gracefully degrades to Layer 1 + Layer 2 without aborting batch
     broken_inspected = pipeline.inspect_lowering_pipeline("broken_fn")
     assert broken_inspected["ir_status"] == IRStatus.DEGRADED.value
+    assert broken_inspected["degraded_reason"] != ""
+
+
+def test_workspace_skips_ignored_dirs_and_cleans_tmp(tmp_path: Path) -> None:
+    """Verify node_modules/build are skipped and no temp dirs leak in BUILD_TMP_ROOT."""
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "dep.js").write_text(
+        "function dep() { return 1; }\n", encoding="utf-8"
+    )
+    (tmp_path / "app.py").write_text("def main_fn():\n    return 42\n", encoding="utf-8")
+
+    before_dirs = set(BUILD_TMP_ROOT.iterdir()) if BUILD_TMP_ROOT.exists() else set()
+    pipeline = CodeIndexPipeline()
+    summary = pipeline.index_workspace(tmp_path)
+    after_dirs = set(BUILD_TMP_ROOT.iterdir()) if BUILD_TMP_ROOT.exists() else set()
+
+    assert summary["indexed_units"] == 1
+    assert after_dirs == before_dirs
+
+
+def test_cpg_ignores_calls_in_comments_and_strings() -> None:
+    """Verify AST-based CPG call extraction ignores comments and string literals."""
+    chunker = ASTChunker()
+    chunks = chunker.chunk_file(
+        "sample.py",
+        source=(
+            "def target_fn():\n"
+            "    return 1\n\n"
+            "def caller_fn():\n"
+            "    # target_fn() in comment\n"
+            '    msg = "target_fn() in string"\n'
+            "    return msg\n"
+        ),
+    )
+    cpg = SemanticCPGBuilder()
+    symbols = cpg.build_from_ast_chunks(chunks)
+    caller_uri = next(u for u, s in symbols.items() if s.display_name == "caller_fn")
+    assert cpg.k_hop_slice(caller_uri, max_hops=1) == []
 
 
 def test_mcp_tools_registered() -> None:

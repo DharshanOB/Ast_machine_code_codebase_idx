@@ -9,10 +9,31 @@ from pathlib import Path
 from typing import Any
 
 import networkx as nx
+import tree_sitter_c
+import tree_sitter_cpp
+import tree_sitter_javascript
+import tree_sitter_python
+import tree_sitter_rust
+from tree_sitter import Language as TSLanguage
+from tree_sitter import Node, Parser
 
-from indexer.models import ASTChunkNode, CPGEdgeKind, SCIPEdge, SCIPSymbolNode
+from indexer.models import ASTChunkNode, CPGEdgeKind, Language, SCIPEdge, SCIPSymbolNode
 
-_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_CALL_NODE_TYPES: frozenset[str] = frozenset(
+    {"call_expression", "call", "macro_invocation", "new_expression"}
+)
+_COMMENT_OR_STRING_TYPES: frozenset[str] = frozenset(
+    {
+        "comment",
+        "line_comment",
+        "block_comment",
+        "string",
+        "string_literal",
+        "raw_string_literal",
+        "char_literal",
+        "template_string",
+    }
+)
 _ASSIGN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
 _INHERIT_RE = re.compile(
     r"(?:class|struct)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\(([^)]+)\)|:\s*(?:public|private|protected)?\s*([A-Za-z_][A-Za-z0-9_:]*))"
@@ -44,6 +65,13 @@ class SemanticCPGBuilder:
         self.version = version
         self.graph: nx.MultiDiGraph[str] = nx.MultiDiGraph()
         self.symbols: dict[str, SCIPSymbolNode] = {}
+        self._parsers: dict[Language, Parser] = {
+            Language.C: Parser(TSLanguage(tree_sitter_c.language())),
+            Language.CPP: Parser(TSLanguage(tree_sitter_cpp.language())),
+            Language.RUST: Parser(TSLanguage(tree_sitter_rust.language())),
+            Language.PYTHON: Parser(TSLanguage(tree_sitter_python.language())),
+            Language.JAVASCRIPT: Parser(TSLanguage(tree_sitter_javascript.language())),
+        }
 
     def ingest_scip_json(self, scip_path: str | Path) -> list[SCIPSymbolNode]:
         """Ingest a JSON-encoded SCIP index payload into the CPG."""
@@ -208,18 +236,89 @@ class SemanticCPGBuilder:
                 )
             )
 
+    def _extract_calls_ast(self, chunk: ASTChunkNode) -> list[tuple[str, int]]:
+        """Extract (callee_name, 1-based line) from AST call nodes, ignoring comments/strings."""
+        parser = self._parsers.get(chunk.language)
+        if parser is None:
+            return []
+        source_bytes = chunk.source_text.encode("utf-8")
+        tree = parser.parse(source_bytes)
+        calls: list[tuple[str, int]] = []
+
+        def _callee_identifier(node: Node) -> str:
+            fn_node = node.child_by_field_name("function") or node.child_by_field_name("macro")
+            if fn_node is None and node.named_children:
+                fn_node = node.named_children[0]
+            if fn_node is None:
+                return ""
+            if fn_node.type in ("attribute", "member_expression", "field_expression"):
+                attr = fn_node.child_by_field_name("attribute") or fn_node.child_by_field_name(
+                    "property"
+                ) or fn_node.child_by_field_name("field")
+                if attr is not None:
+                    return source_bytes[attr.start_byte : attr.end_byte].decode(
+                        "utf-8", errors="replace"
+                    )
+            if fn_node.type in ("scoped_identifier", "qualified_identifier"):
+                name_child = fn_node.child_by_field_name("name")
+                if name_child is not None:
+                    return source_bytes[name_child.start_byte : name_child.end_byte].decode(
+                        "utf-8", errors="replace"
+                    )
+            text = source_bytes[fn_node.start_byte : fn_node.end_byte].decode(
+                "utf-8", errors="replace"
+            )
+            return text.split("::")[-1].split(".")[-1].strip()
+
+        def _walk(node: Node) -> None:
+            if node.type in _COMMENT_OR_STRING_TYPES:
+                return
+            if node.type in _CALL_NODE_TYPES:
+                name = _callee_identifier(node)
+                if name and name not in _KEYWORDS and name != chunk.symbol_name:
+                    line_no = chunk.line_start + node.start_point[0]
+                    calls.append((name, line_no))
+            for child in node.children:
+                _walk(child)
+
+        _walk(tree.root_node)
+        return calls
+
+    def _strip_comments_and_strings(self, chunk: ASTChunkNode) -> str:
+        """Blank out comment and string spans using Tree-sitter so def-use ignores them."""
+        parser = self._parsers.get(chunk.language)
+        if parser is None:
+            return chunk.source_text
+        source_bytes = bytearray(chunk.source_text.encode("utf-8"))
+        tree = parser.parse(bytes(source_bytes))
+
+        def _mask(node: Node) -> None:
+            if node.type in _COMMENT_OR_STRING_TYPES:
+                for i in range(node.start_byte, min(node.end_byte, len(source_bytes))):
+                    if source_bytes[i] != ord("\n"):
+                        source_bytes[i] = ord(" ")
+                return
+            for child in node.children:
+                _mask(child)
+
+        _mask(tree.root_node)
+        return bytes(source_bytes).decode("utf-8", errors="replace")
+
     def _link_calls(
         self, chunk: ASTChunkNode, src_uri: str, name_to_uris: dict[str, list[str]]
     ) -> None:
-        for offset, line_text in enumerate(chunk.source_text.splitlines()):
-            line_no = chunk.line_start + offset
-            for match in _CALL_RE.finditer(line_text):
-                callee_name = match.group(1)
-                if callee_name in _KEYWORDS or callee_name == chunk.symbol_name:
-                    continue
-                for target_uri in name_to_uris.get(callee_name, []):
-                    if target_uri != src_uri:
-                        self._add_edge(src_uri, target_uri, CPGEdgeKind.CALLS, line=line_no)
+        for callee_name, line_no in self._extract_calls_ast(chunk):
+            candidates = [u for u in name_to_uris.get(callee_name, []) if u != src_uri]
+            if not candidates:
+                continue
+            same_file = [
+                u
+                for u in candidates
+                if u in self.symbols and self.symbols[u].file_path == chunk.file_path
+            ]
+            targets = same_file if same_file else candidates
+            for target_uri in targets:
+                self._add_edge(src_uri, target_uri, CPGEdgeKind.CALLS, line=line_no)
 
     def _link_inheritance(
         self, chunk: ASTChunkNode, src_uri: str, name_to_uris: dict[str, list[str]]
@@ -244,7 +343,8 @@ class SemanticCPGBuilder:
     def _link_intraprocedural_def_use(self, chunk: ASTChunkNode, src_uri: str) -> None:
         last_def_node: dict[str, str] = {}
         prev_line_node: str | None = None
-        for offset, line_text in enumerate(chunk.source_text.splitlines()):
+        sanitized_source = self._strip_comments_and_strings(chunk)
+        for offset, line_text in enumerate(sanitized_source.splitlines()):
             stripped = line_text.strip()
             if not stripped:
                 continue

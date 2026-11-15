@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,7 @@ from mcp.server.mcpserver import MCPServer
 from indexer.ast_chunker import ASTChunker, detect_language
 from indexer.binary_lifter import BinaryLifter
 from indexer.dwarf_aligner import DWARFAligner
-from indexer.llvm_ir_pass import LLVMIRPass
+from indexer.llvm_ir_pass import BUILD_TMP_ROOT, LLVMIRPass
 from indexer.models import (
     ASTChunkNode,
     BinaryBasicBlock,
@@ -25,10 +27,24 @@ from indexer.python_bytecode import lower_python_file
 from indexer.semantic_cpg import SemanticCPGBuilder
 from storage.hybrid_store import HybridCodeStore
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_TOKEN_BUDGET = 2048
 CHARS_PER_TOKEN_ESTIMATE = 4
+_IGNORED_DIRS: frozenset[str] = frozenset(
+    {
+        "node_modules",
+        "build",
+        "dist",
+        "target",
+        "venv",
+        ".venv",
+        "__pycache__",
+        "vendor",
+    }
+)
 
-mcp = MCPServer("code-multi-indexer")
+mcp = MCPServer("astraea-code-indexer")
 
 
 def _truncate_to_token_budget(
@@ -65,9 +81,9 @@ class CodeIndexPipeline:
         self, repo_path: str | Path, compile_commands_path: str | Path | None = None
     ) -> dict[str, Any]:
         """Index all supported source files in repo_path across AST, CPG, IR, and Binary layers."""
-        root = Path(repo_path)
-        if not root.exists():
-            return {"indexed_units": 0, "error": f"Path does not exist: {repo_path}"}
+        root = Path(repo_path).resolve()
+        if not root.exists() or not root.is_dir():
+            return {"indexed_units": 0, "error": f"Directory does not exist: {repo_path}"}
 
         compile_flags_by_file = self._load_compile_commands(compile_commands_path)
         all_chunks: list[ASTChunkNode] = []
@@ -77,7 +93,7 @@ class CodeIndexPipeline:
             if not file_path.is_file():
                 continue
             rel_parts = file_path.relative_to(root).parts
-            if any(p.startswith(".") for p in rel_parts):
+            if any(p.startswith(".") or p in _IGNORED_DIRS for p in rel_parts[:-1]):
                 continue
             if detect_language(file_path) is None:
                 continue
@@ -97,43 +113,71 @@ class CodeIndexPipeline:
             bin_by_fn: dict[str, list[BinaryBasicBlock]] = {}
             dwarf_maps: list[DWARFLineMapping] = []
             lang = detect_language(src_path)
+            file_error = ""
 
-            if lang in (Language.C, Language.CPP) and self.ir_pass.clang_bin is not None:
-                flags = compile_flags_by_file.get(str(src_path.resolve()), [])
-                try:
-                    ir_text = self.ir_pass.compile_to_ir(src_path, raw_flags=flags)
-                    for g in self.ir_pass.parse_ir_module(ir_text, source_file=str(src_path)):
-                        ir_by_fn[g.function_name] = g
-                    obj_path = self.lifter.compile_to_object(src_path, raw_flags=flags)
-                    bin_by_fn = self.lifter.lift_elf(obj_path)
-                    dwarf_maps = self.dwarf.extract_mappings(obj_path, default_file=str(src_path))
-                    self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
-                except Exception:
-                    pass
-            elif lang == Language.RUST and self.ir_pass.rustc_bin is not None:
-                try:
-                    ir_text = self.ir_pass.compile_rust_to_ir(src_path)
-                    for g in self.ir_pass.parse_ir_module(ir_text, source_file=str(src_path)):
-                        ir_by_fn[g.function_name] = g
-                    obj_path = self.lifter.compile_rust_to_object(src_path)
-                    bin_by_fn = self.lifter.lift_elf(obj_path)
-                    dwarf_maps = self.dwarf.extract_mappings(obj_path, default_file=str(src_path))
-                    self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
-                except Exception:
-                    pass
+            if lang in (Language.C, Language.CPP):
+                if self.ir_pass.clang_bin is None:
+                    file_error = "clang binary not found on PATH"
+                else:
+                    flags = compile_flags_by_file.get(str(src_path.resolve()), [])
+                    try:
+                        ir_text = self.ir_pass.compile_to_ir(src_path, raw_flags=flags)
+                        for g in self.ir_pass.parse_ir_module(ir_text, source_file=str(src_path)):
+                            ir_by_fn[g.function_name] = g
+                        with tempfile.TemporaryDirectory(dir=BUILD_TMP_ROOT) as tmp_obj_dir:
+                            obj_path = self.lifter.compile_to_object(
+                                src_path,
+                                out_obj_path=Path(tmp_obj_dir) / f"{src_path.stem}.o",
+                                raw_flags=flags,
+                            )
+                            bin_by_fn = self.lifter.lift_elf(obj_path)
+                            dwarf_maps = self.dwarf.extract_mappings(
+                                obj_path, default_file=str(src_path)
+                            )
+                        self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
+                    except Exception as exc:
+                        file_error = str(exc)
+                        logger.warning("Native C/C++ lowering failed for %s: %s", src_path, exc)
+            elif lang == Language.RUST:
+                if self.ir_pass.rustc_bin is None:
+                    file_error = "rustc binary not found on PATH"
+                else:
+                    try:
+                        ir_text = self.ir_pass.compile_rust_to_ir(src_path)
+                        for g in self.ir_pass.parse_ir_module(ir_text, source_file=str(src_path)):
+                            ir_by_fn[g.function_name] = g
+                        with tempfile.TemporaryDirectory(dir=BUILD_TMP_ROOT) as tmp_obj_dir:
+                            obj_path = self.lifter.compile_rust_to_object(
+                                src_path,
+                                out_obj_path=Path(tmp_obj_dir) / f"{src_path.stem}.o",
+                            )
+                            bin_by_fn = self.lifter.lift_elf(obj_path)
+                            dwarf_maps = self.dwarf.extract_mappings(
+                                obj_path, default_file=str(src_path)
+                            )
+                        self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
+                    except Exception as exc:
+                        file_error = str(exc)
+                        logger.warning("Rust lowering failed for %s: %s", src_path, exc)
             elif lang == Language.PYTHON:
-                ir_by_fn, bin_by_fn = lower_python_file(src_path)
+                try:
+                    ir_by_fn, bin_by_fn = lower_python_file(src_path)
+                except Exception as exc:
+                    file_error = str(exc)
+                    logger.warning("Python bytecode lowering failed for %s: %s", src_path, exc)
 
             for chunk in chunks:
                 sym = chunk_to_symbol.get(chunk.chunk_id)
                 ir_graph = ir_by_fn.get(chunk.symbol_name)
                 bin_blocks = bin_by_fn.get(chunk.symbol_name, [])
+                reason = ""
                 if ir_graph is not None or bin_blocks:
                     status = IRStatus.OK
                 elif lang == Language.JAVASCRIPT:
                     status = IRStatus.NOT_APPLICABLE
                 else:
                     status = IRStatus.DEGRADED
+                    reason = file_error or f"No IR/binary symbol matched '{chunk.symbol_name}'"
                 if status == IRStatus.DEGRADED:
                     degraded_count += 1
                 unit_mappings = self.dwarf.lookup_va_for_line(
@@ -146,6 +190,7 @@ class CodeIndexPipeline:
                     binary_blocks=bin_blocks,
                     dwarf_mappings=unit_mappings,
                     ir_status=status,
+                    degraded_reason=reason,
                 )
                 units.append(unit)
                 if sym is not None:
@@ -185,6 +230,7 @@ class CodeIndexPipeline:
         payload: dict[str, Any] = {
             "unit_id": unit.unit_id,
             "ir_status": unit.ir_status.value,
+            "degraded_reason": unit.degraded_reason,
             "ast": {
                 "symbol_name": unit.ast_chunk.symbol_name,
                 "file_path": unit.ast_chunk.file_path,

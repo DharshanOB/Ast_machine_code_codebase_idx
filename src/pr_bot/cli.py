@@ -8,14 +8,20 @@ import os
 import subprocess
 from pathlib import Path
 
-from pr_bot.analyzer import PRReviewReport, RepoReviewReport, analyze_git_pr, analyze_repository
+from pr_bot.analyzer import (
+    PRReviewReport,
+    RepoReviewReport,
+    analyze_git_pr,
+    analyze_repository,
+    resolve_merge_base,
+)
 from pr_bot.gemini_reviewer import generate_vertex_gemini_review
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run PR or full-repo 4-layer analysis and write Markdown + optional inline JSON."""
     parser = argparse.ArgumentParser(
-        prog="ag-pr-review",
+        prog="astraea-review",
         description=(
             "Compiler-aware 4-layer GitHub PR & periodic repo reviewer "
             "(AST + CPG + LLVM IR + Machine Code)."
@@ -72,8 +78,10 @@ def main(argv: list[str] | None = None) -> int:
             compile_commands_path=args.compile_commands,
         )
         inline_comments = report.to_github_review_comments()
+        repo_root = Path(args.repo).resolve()
+        effective_base = resolve_merge_base(repo_root, args.base, args.head)
         diff_proc = subprocess.run(
-            ["git", "-C", str(Path(args.repo).resolve()), "diff", args.base, args.head],
+            ["git", "-C", str(repo_root), "diff", effective_base, args.head],
             shell=False,
             capture_output=True,
             text=True,

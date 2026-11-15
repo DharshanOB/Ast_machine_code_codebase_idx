@@ -189,6 +189,7 @@ class UnifiedCodeUnit(BaseModel):
     binary_blocks: list[BinaryBasicBlock] = Field(default_factory=list)
     dwarf_mappings: list[DWARFLineMapping] = Field(default_factory=list)
     ir_status: IRStatus = IRStatus.DEGRADED
+    degraded_reason: str = ""
 
     def model_post_init(self, __context: Any) -> None:
         if not self.unit_id:

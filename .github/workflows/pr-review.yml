@@ -73,6 +73,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          HEAD_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           REPO: ${{ github.repository }}
         run: |
           gh pr comment "$PR_NUMBER" --body-file pr_review_summary.md
@@ -84,7 +85,7 @@ jobs:
                   "gh", "api",
                   f"repos/{os.environ['REPO']}/pulls/{os.environ['PR_NUMBER']}/comments",
                   "-f", f"body={c['body']}",
-                  "-f", f"commit_id={os.environ.get('GITHUB_SHA', '')}",
+                  "-f", f"commit_id={os.environ.get('HEAD_COMMIT_SHA', '')}",
                   "-f", f"path={c['path']}",
                   "-F", f"line={c['line']}",
                   "-f", "side=RIGHT",
