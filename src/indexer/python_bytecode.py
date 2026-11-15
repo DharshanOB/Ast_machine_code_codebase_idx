@@ -146,11 +146,15 @@ def lower_python_file(
                 stack.append(const)
 
         name = code_obj.co_name
-        if name.startswith("<"):
+        if name == "<module>":
+            key = ""
+        elif name.startswith("<"):
             continue
+        else:
+            key = name
         graph, blocks = _build_code_cfg_and_blocks(code_obj, path_str)
-        if name not in ir_by_fn:
-            ir_by_fn[name] = graph
-            blocks_by_fn[name] = blocks
+        if key not in ir_by_fn:
+            ir_by_fn[key] = graph
+            blocks_by_fn[key] = blocks
 
     return ir_by_fn, blocks_by_fn
