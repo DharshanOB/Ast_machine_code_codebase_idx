@@ -96,6 +96,25 @@ class CodeIndexPipeline:
         self._file_hashes: dict[str, str] = {}
         self._file_chunks: dict[str, list[ASTChunkNode]] = {}
         self._file_unit_ids: dict[str, list[str]] = {}
+        self._restore_persistent_state()
+
+    def _restore_persistent_state(self) -> None:
+        """Restore incremental file hashes, chunks, and symbol mappings from SQLite."""
+        for path_str, (file_hash, unit_ids) in self.store.load_file_state().items():
+            self._file_hashes[path_str] = file_hash
+            self._file_unit_ids[path_str] = list(unit_ids)
+            chunks: list[ASTChunkNode] = []
+            for uid in unit_ids:
+                unit = self.store.units.get(uid)
+                if unit is not None:
+                    chunks.append(unit.ast_chunk)
+            if chunks:
+                self._file_chunks[path_str] = chunks
+        for unit in self.store.units.values():
+            if unit.scip_symbol is not None:
+                self.symbol_to_unit[unit.scip_symbol.symbol_uri] = unit.unit_id
+            if unit.ast_chunk.symbol_name:
+                self.symbol_to_unit[unit.ast_chunk.symbol_name] = unit.unit_id
 
     def index_workspace(
         self,
@@ -117,9 +136,20 @@ class CodeIndexPipeline:
             rel_parts = file_path.relative_to(root).parts
             if any(p.startswith(".") or p in _IGNORED_DIRS for p in rel_parts[:-1]):
                 continue
-            if detect_language(file_path) is None:
+            lang = detect_language(file_path)
+            if lang is None:
                 continue
-            digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+            hasher = hashlib.sha256(file_path.read_bytes())
+            flags = compile_flags_by_file.get(str(file_path.resolve()), [])
+            compiler_bin = ""
+            if lang in (Language.C, Language.CPP):
+                compiler_bin = self.ir_pass.clang_bin or ""
+            elif lang == Language.RUST:
+                compiler_bin = self.ir_pass.rustc_bin or ""
+            hasher.update(
+                b"\0" + json.dumps(flags).encode("utf-8") + b"\0" + compiler_bin.encode("utf-8")
+            )
+            digest = hasher.hexdigest()
             current_files[str(file_path)] = (file_path, digest)
 
         deleted_paths = [p for p in self._file_hashes if p not in current_files]
@@ -128,8 +158,11 @@ class CodeIndexPipeline:
             self._file_hashes.pop(p, None)
             self._file_chunks.pop(p, None)
             stale_unit_ids.extend(self._file_unit_ids.pop(p, []))
+        if deleted_paths:
+            self.store.delete_file_state(deleted_paths)
 
         changed_files: dict[Path, list[ASTChunkNode]] = {}
+        updated_paths: list[str] = []
         skipped_unchanged = 0
         for p_str, (file_path, digest) in current_files.items():
             if incremental and self._file_hashes.get(p_str) == digest:
@@ -138,12 +171,18 @@ class CodeIndexPipeline:
             stale_unit_ids.extend(self._file_unit_ids.pop(p_str, []))
             chunks = self.chunker.chunk_file(file_path)
             self._file_hashes[p_str] = digest
+            updated_paths.append(p_str)
             if chunks:
                 self._file_chunks[p_str] = chunks
                 changed_files[file_path] = chunks
             else:
                 self._file_chunks.pop(p_str, None)
 
+        if stale_unit_ids:
+            stale_set = set(stale_unit_ids)
+            self.symbol_to_unit = {
+                k: v for k, v in self.symbol_to_unit.items() if v not in stale_set
+            }
         deleted_count = self.store.delete_units(stale_unit_ids)
         all_chunks = [c for chunk_list in self._file_chunks.values() for c in chunk_list]
         self.cpg = SemanticCPGBuilder()
@@ -151,6 +190,7 @@ class CodeIndexPipeline:
         chunk_to_symbol = {sym.chunk_id: sym for sym in symbols.values() if sym.chunk_id}
 
         units: list[UnifiedCodeUnit] = []
+        newly_lowered_ir: list[LLVMIRGraph] = []
         degraded_count = 0
 
         for src_path, chunks in changed_files.items():
@@ -213,6 +253,8 @@ class CodeIndexPipeline:
                     file_error = str(exc)
                     logger.warning("Python bytecode lowering failed for %s: %s", src_path, exc)
 
+            newly_lowered_ir.extend(ir_by_fn.values())
+
             for chunk in chunks:
                 sym = chunk_to_symbol.get(chunk.chunk_id)
                 ir_graph = ir_by_fn.get(chunk.symbol_name)
@@ -247,12 +289,37 @@ class CodeIndexPipeline:
                     self.symbol_to_unit[chunk.symbol_name] = unit.unit_id
 
         count = self.store.upsert_units(units)
+        if updated_paths:
+            self.store.save_file_state(
+                {
+                    p_str: (self._file_hashes[p_str], self._file_unit_ids.get(p_str, []))
+                    for p_str in updated_paths
+                }
+            )
+
+        seen_ir_ids: set[int] = set()
+        all_ir_graphs: list[LLVMIRGraph] = []
+        for u in self.store.units.values():
+            if u.ir_graph is not None and id(u.ir_graph) not in seen_ir_ids:
+                seen_ir_ids.add(id(u.ir_graph))
+                all_ir_graphs.append(u.ir_graph)
+        for g in newly_lowered_ir:
+            if id(g) not in seen_ir_ids:
+                seen_ir_ids.add(id(g))
+                all_ir_graphs.append(g)
+        ir_cpg_validation = self.cpg.validate_against_ir_calls(all_ir_graphs)
+
         return {
             "indexed_units": count,
             "skipped_unchanged_files": skipped_unchanged,
             "deleted_units": deleted_count,
             "degraded_units": degraded_count,
             "symbols_count": len(symbols),
+            "ir_cpg_validation": {
+                "confirmed": len(ir_cpg_validation["confirmed"]),
+                "cpg_only": len(ir_cpg_validation["cpg_only"]),
+                "ir_only": len(ir_cpg_validation["ir_only"]),
+            },
         }
 
     def inspect_lowering_pipeline(

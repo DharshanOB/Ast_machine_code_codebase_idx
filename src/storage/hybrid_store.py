@@ -166,6 +166,50 @@ class HybridCodeStore:
             digest = hashlib.sha256(unit_id.encode("utf-8")).digest()
             return (int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)) or 1
 
+    def _prepare_unit_index_data(
+        self, unit: UnifiedCodeUnit
+    ) -> tuple[tantivy.Document, dict[str, list[float]], int, PointStruct]:
+        """Build Tantivy document, modality vectors, point ID, and Qdrant point for a unit."""
+        ast = unit.ast_chunk
+        ir_tokens = unit.ir_graph.canonical_tokens if unit.ir_graph else []
+        asm_tokens = [
+            insn for bb in unit.binary_blocks for insn in bb.normalized_instructions
+        ]
+        doc = tantivy.Document(
+            unit_id=unit.unit_id,
+            symbol_name=ast.symbol_name or "anonymous",
+            file_path=ast.file_path,
+            source_tokens=" ".join(ast.lexical_tokens),
+            ir_tokens=" ".join(ir_tokens),
+            asm_tokens=" ".join(asm_tokens),
+        )
+        ast_vec = _hash_feature_vector(
+            [*ast.lexical_tokens, *split_identifier_tokens(ast.scope_header)],
+            VECTOR_DIM_AST,
+        )
+        ir_vec = compute_wl_ir_vector(unit.ir_graph)
+        bin_vec = compute_binary_cfg_vector(unit.binary_blocks)
+        vectors = {
+            "ast_dense": ast_vec,
+            "ir_structural": ir_vec,
+            "bin_cfg": bin_vec,
+        }
+        pid = self._unit_point_id(unit.unit_id)
+        point = PointStruct(
+            id=pid,
+            vector={
+                "ast_dense": ast_vec,
+                "ir_structural": ir_vec,
+                "bin_cfg": bin_vec,
+            },
+            payload={
+                "unit_id": unit.unit_id,
+                "symbol_name": ast.symbol_name,
+                "file_path": ast.file_path,
+            },
+        )
+        return doc, vectors, pid, point
+
     def upsert_units(
         self, units: list[UnifiedCodeUnit], commit_sha: str = "working-tree"
     ) -> int:
@@ -173,63 +217,23 @@ class HybridCodeStore:
         if not units:
             return 0
 
+        if self._db_path is not None:
+            self._save_snapshot(commit_sha, units)
+
         writer = self._tantivy_index.writer()
         qdrant_points: list[PointStruct] = []
         staged_units: dict[str, UnifiedCodeUnit] = {}
         staged_vectors: dict[str, dict[str, list[float]]] = {}
+        staged_point_ids: dict[str, int] = {}
 
         for unit in units:
             staged_units[unit.unit_id] = unit
-            ast = unit.ast_chunk
-            ir_tokens = unit.ir_graph.canonical_tokens if unit.ir_graph else []
-            asm_tokens = [
-                insn for bb in unit.binary_blocks for insn in bb.normalized_instructions
-            ]
-
+            doc, vectors, pid, point = self._prepare_unit_index_data(unit)
             writer.delete_documents_by_term("unit_id", unit.unit_id)
-            writer.add_document(
-                tantivy.Document(
-                    unit_id=unit.unit_id,
-                    symbol_name=ast.symbol_name or "anonymous",
-                    file_path=ast.file_path,
-                    source_tokens=" ".join(ast.lexical_tokens),
-                    ir_tokens=" ".join(ir_tokens),
-                    asm_tokens=" ".join(asm_tokens),
-                )
-            )
-
-            ast_vec = _hash_feature_vector(
-                [*ast.lexical_tokens, *split_identifier_tokens(ast.scope_header)],
-                VECTOR_DIM_AST,
-            )
-            ir_vec = compute_wl_ir_vector(unit.ir_graph)
-            bin_vec = compute_binary_cfg_vector(unit.binary_blocks)
-            staged_vectors[unit.unit_id] = {
-                "ast_dense": ast_vec,
-                "ir_structural": ir_vec,
-                "bin_cfg": bin_vec,
-            }
-
-            pid = self._unit_point_id(unit.unit_id)
-            self._point_ids[unit.unit_id] = pid
-            qdrant_points.append(
-                PointStruct(
-                    id=pid,
-                    vector={
-                        "ast_dense": ast_vec,
-                        "ir_structural": ir_vec,
-                        "bin_cfg": bin_vec,
-                    },
-                    payload={
-                        "unit_id": unit.unit_id,
-                        "symbol_name": ast.symbol_name,
-                        "file_path": ast.file_path,
-                    },
-                )
-            )
-
-        if self._db_path is not None:
-            self._save_snapshot(commit_sha, units)
+            writer.add_document(doc)
+            staged_vectors[unit.unit_id] = vectors
+            staged_point_ids[unit.unit_id] = pid
+            qdrant_points.append(point)
 
         writer.commit()
         self._tantivy_index.reload()
@@ -238,6 +242,7 @@ class HybridCodeStore:
         for uid, unit in staged_units.items():
             self.units[uid] = unit
             self.unit_vectors[uid] = staged_vectors[uid]
+            self._point_ids[uid] = staged_point_ids[uid]
             ast = unit.ast_chunk
             self.graph.add_node(
                 uid,
@@ -256,21 +261,26 @@ class HybridCodeStore:
         return len(units)
 
     def delete_units(self, unit_ids: list[str]) -> int:
-        """Delete stale/removed units across Tantivy, Qdrant, SQLite, and in-memory state."""
+        """Delete stale/removed units across SQLite, Tantivy, Qdrant, and in-memory state."""
         if not unit_ids:
             return 0
+
+        if self._db_path is not None:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO tombstones (unit_id) VALUES (?)",
+                    [(u,) for u in unit_ids],
+                )
+                conn.executemany(
+                    "DELETE FROM units WHERE unit_id = ?",
+                    [(u,) for u in unit_ids],
+                )
+
         writer = self._tantivy_index.writer()
         point_ids: list[int | str | UUID] = []
-        removed = 0
         for uid in unit_ids:
             writer.delete_documents_by_term("unit_id", uid)
-            point_ids.append(self._point_ids.pop(uid, self._unit_point_id(uid)))
-            if uid in self.units:
-                self.units.pop(uid, None)
-                self.unit_vectors.pop(uid, None)
-                if uid in self.graph:
-                    self.graph.remove_node(uid)
-                removed += 1
+            point_ids.append(self._point_ids.get(uid, self._unit_point_id(uid)))
         writer.commit()
         self._tantivy_index.reload()
         if point_ids:
@@ -278,72 +288,171 @@ class HybridCodeStore:
                 collection_name=self.COLLECTION_NAME,
                 points_selector=PointIdsList(points=point_ids),
             )
+
+        removed = 0
+        for uid in unit_ids:
+            self._point_ids.pop(uid, None)
+            if uid in self.units:
+                self.units.pop(uid, None)
+                self.unit_vectors.pop(uid, None)
+                if uid in self.graph:
+                    self.graph.remove_node(uid)
+                removed += 1
+
         if self._db_path is not None:
             with sqlite3.connect(self._db_path) as conn:
-                conn.executemany("DELETE FROM units WHERE unit_id = ?", [(u,) for u in unit_ids])
+                conn.executemany(
+                    "DELETE FROM tombstones WHERE unit_id = ?",
+                    [(u,) for u in unit_ids],
+                )
         return removed
 
     def recover_from_sqlite(self) -> int:
-        """Reload units from SQLite and reconcile Tantivy and Qdrant indexes."""
+        """Reload units from SQLite, replay tombstones, and reconcile Tantivy/Qdrant."""
         if self._db_path is None or not self._db_path.exists():
             return 0
         with sqlite3.connect(self._db_path) as conn:
-            rows = conn.execute("SELECT unit_json FROM units").fetchall()
-        if not rows:
+            tombstone_rows = conn.execute("SELECT unit_id FROM tombstones").fetchall()
+            unit_rows = conn.execute("SELECT unit_json FROM units").fetchall()
+
+        tombstone_ids = [str(r[0]) for r in tombstone_rows]
+        recovered = [UnifiedCodeUnit.model_validate_json(r[0]) for r in unit_rows]
+        active_ids = {u.unit_id for u in recovered}
+
+        if tombstone_ids:
+            writer = self._tantivy_index.writer()
+            for uid in tombstone_ids:
+                writer.delete_documents_by_term("unit_id", uid)
+            writer.commit()
+            self._tantivy_index.reload()
+            self._qdrant.delete(
+                collection_name=self.COLLECTION_NAME,
+                points_selector=PointIdsList(
+                    points=[self._unit_point_id(uid) for uid in tombstone_ids]
+                ),
+            )
+            with sqlite3.connect(self._db_path) as conn:
+                conn.executemany(
+                    "DELETE FROM tombstones WHERE unit_id = ?",
+                    [(uid,) for uid in tombstone_ids],
+                )
+
+        self._reconcile_stray_ids(active_ids)
+
+        for stale_uid in [uid for uid in self.units if uid not in active_ids]:
+            self.units.pop(stale_uid, None)
+            self.unit_vectors.pop(stale_uid, None)
+            self._point_ids.pop(stale_uid, None)
+            if stale_uid in self.graph:
+                self.graph.remove_node(stale_uid)
+
+        if not recovered:
             return 0
-        recovered = [UnifiedCodeUnit.model_validate_json(r[0]) for r in rows]
+
         writer = self._tantivy_index.writer()
         qdrant_points: list[PointStruct] = []
+        staged_vectors: dict[str, dict[str, list[float]]] = {}
+        staged_point_ids: dict[str, int] = {}
         for unit in recovered:
-            self.units[unit.unit_id] = unit
-            ast = unit.ast_chunk
-            ir_tokens = unit.ir_graph.canonical_tokens if unit.ir_graph else []
-            asm_tokens = [
-                insn for bb in unit.binary_blocks for insn in bb.normalized_instructions
-            ]
+            doc, vectors, pid, point = self._prepare_unit_index_data(unit)
             writer.delete_documents_by_term("unit_id", unit.unit_id)
-            writer.add_document(
-                tantivy.Document(
-                    unit_id=unit.unit_id,
-                    symbol_name=ast.symbol_name or "anonymous",
-                    file_path=ast.file_path,
-                    source_tokens=" ".join(ast.lexical_tokens),
-                    ir_tokens=" ".join(ir_tokens),
-                    asm_tokens=" ".join(asm_tokens),
-                )
-            )
-            ast_vec = _hash_feature_vector(
-                [*ast.lexical_tokens, *split_identifier_tokens(ast.scope_header)],
-                VECTOR_DIM_AST,
-            )
-            ir_vec = compute_wl_ir_vector(unit.ir_graph)
-            bin_vec = compute_binary_cfg_vector(unit.binary_blocks)
-            self.unit_vectors[unit.unit_id] = {
-                "ast_dense": ast_vec,
-                "ir_structural": ir_vec,
-                "bin_cfg": bin_vec,
-            }
-            pid = self._unit_point_id(unit.unit_id)
-            self._point_ids[unit.unit_id] = pid
-            qdrant_points.append(
-                PointStruct(
-                    id=pid,
-                    vector={
-                        "ast_dense": ast_vec,
-                        "ir_structural": ir_vec,
-                        "bin_cfg": bin_vec,
-                    },
-                    payload={
-                        "unit_id": unit.unit_id,
-                        "symbol_name": ast.symbol_name,
-                        "file_path": ast.file_path,
-                    },
-                )
-            )
+            writer.add_document(doc)
+            staged_vectors[unit.unit_id] = vectors
+            staged_point_ids[unit.unit_id] = pid
+            qdrant_points.append(point)
         writer.commit()
         self._tantivy_index.reload()
         self._qdrant.upsert(collection_name=self.COLLECTION_NAME, points=qdrant_points)
+        for unit in recovered:
+            self.units[unit.unit_id] = unit
+            self.unit_vectors[unit.unit_id] = staged_vectors[unit.unit_id]
+            self._point_ids[unit.unit_id] = staged_point_ids[unit.unit_id]
         return len(recovered)
+
+    def _reconcile_stray_ids(self, active_ids: set[str]) -> None:
+        """Delete any Tantivy documents or Qdrant points not present in SQLite active_ids."""
+        searcher = self._tantivy_index.searcher()
+        if searcher.num_docs > 0:
+            all_hits = searcher.search(tantivy.Query.all_query(), searcher.num_docs).hits
+            stray_tantivy_ids: set[str] = set()
+            for _, doc_addr in all_hits:
+                vals = searcher.doc(doc_addr).get_all("unit_id")
+                if vals:
+                    uid = str(vals[0])
+                    if uid not in active_ids:
+                        stray_tantivy_ids.add(uid)
+            if stray_tantivy_ids:
+                writer = self._tantivy_index.writer()
+                for uid in stray_tantivy_ids:
+                    writer.delete_documents_by_term("unit_id", uid)
+                writer.commit()
+                self._tantivy_index.reload()
+
+        stray_qdrant_ids: list[int | str | UUID] = []
+        offset: Any = None
+        while True:
+            points, next_offset = self._qdrant.scroll(
+                collection_name=self.COLLECTION_NAME,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for pt in points:
+                payload = pt.payload or {}
+                uid = str(payload.get("unit_id", ""))
+                if not uid or uid not in active_ids:
+                    stray_qdrant_ids.append(pt.id)
+            if next_offset is None:
+                break
+            offset = next_offset
+        if stray_qdrant_ids:
+            self._qdrant.delete(
+                collection_name=self.COLLECTION_NAME,
+                points_selector=PointIdsList(points=stray_qdrant_ids),
+            )
+
+    def save_file_state(self, updates: dict[str, tuple[str, list[str]]]) -> None:
+        """Persist per-file content hashes and indexed unit IDs in SQLite."""
+        if self._db_path is None or not updates:
+            return
+        rows = [
+            (file_path, content_hash, json.dumps(unit_ids))
+            for file_path, (content_hash, unit_ids) in updates.items()
+        ]
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO file_state (file_path, content_hash, unit_ids_json)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
+
+    def delete_file_state(self, file_paths: list[str]) -> None:
+        """Remove persisted file state entries for deleted files."""
+        if self._db_path is None or not file_paths:
+            return
+        with sqlite3.connect(self._db_path) as conn:
+            conn.executemany(
+                "DELETE FROM file_state WHERE file_path = ?",
+                [(fp,) for fp in file_paths],
+            )
+
+    def load_file_state(self) -> dict[str, tuple[str, list[str]]]:
+        """Load persisted per-file content hashes and unit IDs from SQLite."""
+        if self._db_path is None or not self._db_path.exists():
+            return {}
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT file_path, content_hash, unit_ids_json FROM file_state"
+            ).fetchall()
+        state: dict[str, tuple[str, list[str]]] = {}
+        for file_path, content_hash, unit_ids_json in rows:
+            raw_ids = json.loads(str(unit_ids_json))
+            unit_ids = [str(uid) for uid in raw_ids] if isinstance(raw_ids, list) else []
+            state[str(file_path)] = (str(content_hash), unit_ids)
+        return state
 
     def verify_consistency(self) -> dict[str, Any]:
         """Check document/point/row counts across in-memory, Tantivy, Qdrant, and SQLite."""
@@ -543,12 +652,29 @@ class HybridCodeStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tombstones (
+                    unit_id TEXT PRIMARY KEY
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_state (
+                    file_path TEXT PRIMARY KEY,
+                    content_hash TEXT NOT NULL,
+                    unit_ids_json TEXT NOT NULL
+                )
+                """
+            )
 
     def _save_snapshot(self, commit_sha: str, units: list[UnifiedCodeUnit]) -> None:
         if self._db_path is None:
             return
         payload = json.dumps([u.model_dump(mode="json") for u in units])
         unit_rows = [(u.unit_id, commit_sha, u.model_dump_json()) for u in units]
+        unit_ids = [u.unit_id for u in units]
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO snapshots (commit_sha, payload_json) VALUES (?, ?)",
@@ -558,3 +684,10 @@ class HybridCodeStore:
                 "INSERT OR REPLACE INTO units (unit_id, commit_sha, unit_json) VALUES (?, ?, ?)",
                 unit_rows,
             )
+            for idx in range(0, len(unit_ids), 500):
+                batch = unit_ids[idx : idx + 500]
+                placeholders = ",".join("?" for _ in batch)
+                conn.execute(
+                    f"DELETE FROM tombstones WHERE unit_id IN ({placeholders})",
+                    batch,
+                )

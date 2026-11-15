@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+from indexer.ast_chunker import ASTChunker
 from indexer.llvm_ir_pass import LLVMIRPass, resolve_clang_binary
+from indexer.models import Language, UnifiedCodeUnit
 from mcp_server.code_index_server import CodeIndexPipeline
 from pr_bot.cli import main as cli_main
 from storage.hybrid_store import HybridCodeStore
@@ -143,3 +148,134 @@ def test_hybrid_store_reindexing_deletion_and_sqlite_recovery(tmp_path: Path) ->
     assert len(restarted.units) == 1
     assert restarted.verify_consistency()["consistent"] is True
     restarted.close()
+
+
+def test_pipeline_restart_persists_incremental_state_and_handles_deletes(
+    tmp_path: Path,
+) -> None:
+    """Incremental file hashes and unit IDs persist across pipeline restarts."""
+    storage_dir = tmp_path / "idx"
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    file_a = repo_dir / "a.py"
+    file_b = repo_dir / "b.py"
+    file_a.write_text("def func_a(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    file_b.write_text("def func_b(y: int) -> int:\n    return y + 2\n", encoding="utf-8")
+
+    pipeline = CodeIndexPipeline(storage_dir=storage_dir)
+    first = pipeline.index_workspace(repo_dir)
+    assert first["indexed_units"] == 2
+    assert pipeline.store.verify_consistency()["consistent"] is True
+    pipeline.store.close()
+
+    file_a.unlink()
+    file_b.write_text("def func_b(y: int) -> int:\n    return y + 20\n", encoding="utf-8")
+
+    restarted = CodeIndexPipeline(storage_dir=storage_dir)
+    second = restarted.index_workspace(repo_dir, incremental=True)
+    # 1 unit from deleted file_a + 1 old unit replaced in modified file_b
+    assert second["deleted_units"] == 2
+    assert second["indexed_units"] == 1
+    assert len(restarted.store.units) == 1
+    assert restarted.store.verify_consistency()["consistent"] is True
+    restarted.store.close()
+
+
+def test_compile_commands_change_invalidates_incremental_cache(tmp_path: Path) -> None:
+    """Changing compiler flags in compile_commands.json invalidates cached file state."""
+    if resolve_clang_binary() is None:
+        pytest.skip("clang binary not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    src = repo_dir / "main.c"
+    src.write_text("int compute(void) { return VAL; }\n", encoding="utf-8")
+
+    cc_path = tmp_path / "compile_commands.json"
+
+    def _write_cc(val: int) -> None:
+        cc_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "directory": str(repo_dir),
+                        "file": str(src),
+                        "arguments": ["clang", f"-DVAL={val}"],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    _write_cc(1)
+    pipeline = CodeIndexPipeline(storage_dir=tmp_path / "idx")
+    first = pipeline.index_workspace(repo_dir, compile_commands_path=cc_path)
+    assert first["indexed_units"] == 1
+
+    _write_cc(2)
+    second = pipeline.index_workspace(
+        repo_dir, compile_commands_path=cc_path, incremental=True
+    )
+    assert second["skipped_unchanged_files"] == 0
+    assert second["indexed_units"] == 1
+    pipeline.store.close()
+
+
+def test_sqlite_tombstone_replay_on_crash_recovery(tmp_path: Path) -> None:
+    """Unreconciled SQLite tombstones purge stale entries from Tantivy and Qdrant on restart."""
+    storage_dir = tmp_path / "idx"
+    store = HybridCodeStore(storage_dir=storage_dir)
+
+    chunk = ASTChunker().chunk_source(
+        "def target(x: int) -> int:\n    return x + 1\n",
+        Language.PYTHON,
+        "target.py",
+    )[0]
+    unit = UnifiedCodeUnit(ast_chunk=chunk)
+    store.upsert_units([unit])
+    assert store.verify_consistency() == {
+        "consistent": True,
+        "memory": 1,
+        "tantivy": 1,
+        "qdrant": 1,
+        "sqlite": 1,
+    }
+
+    db_path = storage_dir / "graph_snapshots.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO tombstones (unit_id) VALUES (?)",
+            (unit.unit_id,),
+        )
+        conn.execute("DELETE FROM units WHERE unit_id = ?", (unit.unit_id,))
+        conn.commit()
+    store.close()
+
+    recovered = HybridCodeStore(storage_dir=storage_dir)
+    assert recovered.verify_consistency() == {
+        "consistent": True,
+        "memory": 0,
+        "tantivy": 0,
+        "qdrant": 0,
+        "sqlite": 0,
+    }
+    recovered.close()
+
+
+def test_index_workspace_reports_ir_cpg_validation(tmp_path: Path) -> None:
+    """index_workspace reports IR-CPG call-edge validation metrics for C code."""
+    if resolve_clang_binary() is None:
+        pytest.skip("clang binary not available")
+
+    src = tmp_path / "calls.c"
+    src.write_text(
+        "__attribute__((noinline)) int leaf(int x) { return x + 1; }\n"
+        "int caller(int y) { return leaf(y) * 2; }\n",
+        encoding="utf-8",
+    )
+
+    pipeline = CodeIndexPipeline(storage_dir=tmp_path / "idx")
+    summary = pipeline.index_workspace(tmp_path)
+    assert "ir_cpg_validation" in summary
+    assert summary["ir_cpg_validation"]["confirmed"] >= 1
+    pipeline.store.close()

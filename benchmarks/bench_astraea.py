@@ -8,61 +8,255 @@ import time
 from pathlib import Path
 
 from indexer.ast_chunker import ASTChunker
-from indexer.models import Language
+from indexer.models import ASTChunkNode, Language
 from indexer.semantic_cpg import SemanticCPGBuilder
 from mcp_server.code_index_server import CodeIndexPipeline
 
+_CALLABLE_KINDS: frozenset[str] = frozenset(
+    {
+        "function_definition",
+        "function_item",
+        "function_declaration",
+        "generator_function_declaration",
+        "method_definition",
+    }
+)
 
-def run_cross_language_accuracy_benchmark() -> dict[str, dict[str, float]]:
-    """Measure AST chunk recall and CPG call-graph precision/recall across 5 languages."""
-    samples: dict[Language, tuple[str, str, set[tuple[str, str]]]] = {
+_INCOMPATIBLE_CHECK_LANGS: frozenset[Language] = frozenset(
+    {Language.C, Language.CPP, Language.RUST, Language.PYTHON, Language.JAVASCRIPT}
+)
+
+
+def _language_corpus() -> dict[
+    Language, tuple[list[tuple[str, str]], set[str], set[tuple[str, str]]]
+]:
+    """Return multi-file corpus per language: (files, expected_symbols, expected_call_edges)."""
+    return {
         Language.C: (
-            "sample.c",
-            "int leaf(int x) { return x + 1; }\n"
-            "// leaf(0) in comment must be ignored\n"
-            "int caller(int y) { return leaf(y); }\n",
-            {("caller", "leaf")},
+            [
+                (
+                    "c_math.c",
+                    "struct ScaleConfig { int factor; };\n"
+                    "int compute(int x) { return x * 2; }\n"
+                    "int scale_value(int v, struct ScaleConfig cfg) {\n"
+                    "    return compute(v) + cfg.factor;\n"
+                    "}\n",
+                ),
+                (
+                    "c_app.c",
+                    "int normalize(int v) { return v > 0 ? v : 0; }\n"
+                    "int run_c_pipeline(int x) {\n"
+                    "    // compute(99); normalize(0);\n"
+                    "    /* scale_value(1, cfg); */\n"
+                    '    const char *msg = "compute(42) scale_value(3)";\n'
+                    "    struct ScaleConfig cfg = {3};\n"
+                    "    int s = scale_value(x, cfg);\n"
+                    "    return normalize(s);\n"
+                    "}\n",
+                ),
+            ],
+            {"ScaleConfig", "compute", "scale_value", "normalize", "run_c_pipeline"},
+            {
+                ("scale_value", "compute"),
+                ("run_c_pipeline", "scale_value"),
+                ("run_c_pipeline", "normalize"),
+            },
         ),
         Language.CPP: (
-            "sample.cpp",
-            "int leaf(int x) { return x + 1; }\n"
-            "int caller(int y) { return leaf(y); }\n",
-            {("caller", "leaf")},
+            [
+                (
+                    "cpp_core.cpp",
+                    "namespace math {\n"
+                    "int cpp_leaf(int x) { return x + 1; }\n"
+                    "int cpp_scale(int x) { return cpp_leaf(x) * 2; }\n"
+                    "}\n"
+                    "class Engine {\n"
+                    "public:\n"
+                    "    int apply(int v) { return math::cpp_scale(v); }\n"
+                    "};\n",
+                ),
+                (
+                    "cpp_app.cpp",
+                    "int cpp_dispatch(int x) {\n"
+                    "    // cpp_leaf(0); apply(0);\n"
+                    '    const char *trap = "cpp_scale(10)";\n'
+                    "    Engine eng;\n"
+                    "    return eng.apply(x);\n"
+                    "}\n",
+                ),
+            ],
+            {"cpp_leaf", "cpp_scale", "Engine", "apply", "cpp_dispatch"},
+            {
+                ("cpp_scale", "cpp_leaf"),
+                ("apply", "cpp_scale"),
+                ("cpp_dispatch", "apply"),
+            },
         ),
         Language.RUST: (
-            "sample.rs",
-            "fn leaf(x: i32) -> i32 { x + 1 }\n"
-            "fn caller(y: i32) -> i32 { leaf(y) }\n",
-            {("caller", "leaf")},
+            [
+                (
+                    "rs_core.rs",
+                    "pub struct Accumulator { base: i32 }\n"
+                    "pub fn compute(x: i32) -> i32 { x + 10 }\n"
+                    "impl Accumulator {\n"
+                    "    pub fn step(&self, v: i32) -> i32 {\n"
+                    "        compute(v) + self.base\n"
+                    "    }\n"
+                    "}\n",
+                ),
+                (
+                    "rs_app.rs",
+                    "mod pipeline {\n"
+                    "    pub fn finalize(v: i32) -> i32 { v * 2 }\n"
+                    "}\n"
+                    "pub fn run_rs(v: i32) -> i32 {\n"
+                    "    // compute(0); step(0);\n"
+                    '    let _trap = "finalize(1) compute(2)";\n'
+                    "    let acc = Accumulator { base: 1 };\n"
+                    "    let s = acc.step(v);\n"
+                    "    pipeline::finalize(s)\n"
+                    "}\n",
+                ),
+            ],
+            {"Accumulator", "compute", "step", "finalize", "run_rs"},
+            {
+                ("step", "compute"),
+                ("run_rs", "step"),
+                ("run_rs", "finalize"),
+            },
         ),
         Language.PYTHON: (
-            "sample.py",
-            "def leaf(x: int) -> int:\n    return x + 1\n\n"
-            "def caller(y: int) -> int:\n    # leaf(0)\n    return leaf(y)\n",
-            {("caller", "leaf")},
+            [
+                (
+                    "py_core.py",
+                    "def compute(x: int) -> int:\n"
+                    "    return x + 1\n\n"
+                    "class Pipeline:\n"
+                    "    def transform(self, v: int) -> int:\n"
+                    "        return compute(v) * 2\n",
+                ),
+                (
+                    "py_app.py",
+                    "def validate(v: int) -> int:\n"
+                    "    return v if v > 0 else 0\n\n"
+                    "def run_py(x: int) -> int:\n"
+                    "    # compute(0); transform(0)\n"
+                    '    note = "compute(99) validate(1)"\n'
+                    "    p = Pipeline()\n"
+                    "    return validate(p.transform(x))\n",
+                ),
+            ],
+            {"compute", "Pipeline", "transform", "validate", "run_py"},
+            {
+                ("transform", "compute"),
+                ("run_py", "Pipeline"),
+                ("run_py", "transform"),
+                ("run_py", "validate"),
+            },
         ),
         Language.JAVASCRIPT: (
-            "sample.js",
-            "function leaf(x) { return x + 1; }\n"
-            "function caller(y) { return leaf(y); }\n",
-            {("caller", "leaf")},
+            [
+                (
+                    "js_core.js",
+                    "function compute(x) { return x + 5; }\n"
+                    "class Runner {\n"
+                    "    execute(v) { return compute(v); }\n"
+                    "}\n",
+                ),
+                (
+                    "js_app.js",
+                    "function formatResult(v) { return v * 3; }\n"
+                    "function runJs(x) {\n"
+                    "    // compute(0); execute(0);\n"
+                    "    const trap = `formatResult(1) compute(2)`;\n"
+                    "    const r = new Runner();\n"
+                    "    return formatResult(r.execute(x));\n"
+                    "}\n",
+                ),
+            ],
+            {"compute", "Runner", "execute", "formatResult", "runJs"},
+            {
+                ("execute", "compute"),
+                ("runJs", "Runner"),
+                ("runJs", "execute"),
+                ("runJs", "formatResult"),
+            },
         ),
     }
 
+
+def _are_languages_isolated(src_lang: Language, dst_lang: Language) -> bool:
+    """Return True if an edge between src_lang and dst_lang is language-compatible."""
+    c_family = {Language.C, Language.CPP}
+    if src_lang in c_family and dst_lang in c_family:
+        return True
+    return src_lang == dst_lang
+
+
+def run_cross_language_accuracy_benchmark() -> dict[str, dict[str, float]]:
+    """Measure AST symbol recall, CPG call precision/recall, and cross-language isolation."""
+    corpus = _language_corpus()
     chunker = ASTChunker()
     results: dict[str, dict[str, float]] = {}
-    for lang, (fname, src, expected_edges) in samples.items():
-        chunks = chunker.chunk_file(fname, source=src)
+
+    all_chunks: list[ASTChunkNode] = []
+    file_to_lang: dict[str, Language] = {}
+
+    for lang, (files, expected_symbols, expected_edges) in corpus.items():
+        lang_chunks: list[ASTChunkNode] = []
+        for fname, src in files:
+            file_to_lang[fname] = lang
+            lang_chunks.extend(chunker.chunk_file(fname, source=src))
+        all_chunks.extend(lang_chunks)
+
         cpg = SemanticCPGBuilder()
-        symbols = cpg.build_from_ast_chunks(chunks)
+        symbols = cpg.build_from_ast_chunks(lang_chunks)
+
+        found_symbols = {sym.display_name for sym in symbols.values()}
+        symbol_tp = len(found_symbols & expected_symbols)
+        symbol_recall = symbol_tp / len(expected_symbols) if expected_symbols else 1.0
+
         found_edges: set[tuple[str, str]] = set()
         for u, v, data in cpg.graph.edges(data=True):
-            if data.get("kind") == "CALLS" and u in symbols and v in symbols:
+            if (
+                data.get("kind") == "CALLS"
+                and u in symbols
+                and v in symbols
+                and symbols[u].kind in _CALLABLE_KINDS
+            ):
                 found_edges.add((symbols[u].display_name, symbols[v].display_name))
-        tp = len(found_edges & expected_edges)
-        precision = tp / len(found_edges) if found_edges else 0.0
-        recall = tp / len(expected_edges) if expected_edges else 1.0
-        results[lang.value] = {"precision": precision, "recall": recall}
+
+        edge_tp = len(found_edges & expected_edges)
+        precision = edge_tp / len(found_edges) if found_edges else 0.0
+        recall = edge_tp / len(expected_edges) if expected_edges else 1.0
+        results[lang.value] = {
+            "symbol_recall": symbol_recall,
+            "precision": precision,
+            "recall": recall,
+        }
+
+    # Unified multi-language CPG: verify shared symbol names (e.g. `compute`) do not cross-link.
+    unified_cpg = SemanticCPGBuilder()
+    unified_symbols = unified_cpg.build_from_ast_chunks(all_chunks)
+    total_calls = 0
+    cross_lang_violations = 0
+    for u, v, data in unified_cpg.graph.edges(data=True):
+        if data.get("kind") != "CALLS" or u not in unified_symbols or v not in unified_symbols:
+            continue
+        src_lang = file_to_lang.get(unified_symbols[u].file_path)
+        dst_lang = file_to_lang.get(unified_symbols[v].file_path)
+        if src_lang in _INCOMPATIBLE_CHECK_LANGS and dst_lang in _INCOMPATIBLE_CHECK_LANGS:
+            total_calls += 1
+            if not _are_languages_isolated(src_lang, dst_lang):
+                cross_lang_violations += 1
+
+    isolation = (
+        (total_calls - cross_lang_violations) / total_calls if total_calls else 1.0
+    )
+    results["cross_language_isolation"] = {
+        "isolation": isolation,
+        "violations": float(cross_lang_violations),
+    }
     return results
 
 

@@ -80,6 +80,7 @@ class SemanticCPGBuilder:
         self.graph: nx.MultiDiGraph[str] = nx.MultiDiGraph()
         self.symbols: dict[str, SCIPSymbolNode] = {}
         self._uri_languages: dict[str, Language] = {}
+        self._uri_scopes: dict[str, str] = {}
         self._parsers: dict[Language, Parser] = {
             Language.C: Parser(TSLanguage(tree_sitter_c.language())),
             Language.CPP: Parser(TSLanguage(tree_sitter_cpp.language())),
@@ -153,6 +154,7 @@ class SemanticCPGBuilder:
             )
             self._register_symbol(node)
             self._uri_languages[uri] = chunk.language
+            self._uri_scopes[uri] = chunk.scope_header
             name_to_uris.setdefault(name, []).append(uri)
             chunk_uris.append((chunk, uri))
 
@@ -252,48 +254,83 @@ class SemanticCPGBuilder:
                 )
             )
 
-    def _extract_calls_ast(self, chunk: ASTChunkNode) -> list[tuple[str, int]]:
-        """Extract (callee_name, 1-based line) from AST call nodes, ignoring comments/strings."""
+    def _extract_calls_ast(self, chunk: ASTChunkNode) -> list[tuple[str, str, int]]:
+        """Extract (callee_name, qualifier, 1-based line) from AST call nodes."""
         parser = self._parsers.get(chunk.language)
         if parser is None:
             return []
         source_bytes = chunk.source_text.encode("utf-8")
         tree = parser.parse(source_bytes)
-        calls: list[tuple[str, int]] = []
+        calls: list[tuple[str, str, int]] = []
 
-        def _callee_identifier(node: Node) -> str:
+        def _leaf_qualifier(raw: str) -> str:
+            return raw.split("::")[-1].split(".")[-1].strip()
+
+        def _callee_identifier(node: Node) -> tuple[str, str]:
             fn_node = node.child_by_field_name("function") or node.child_by_field_name("macro")
             if fn_node is None and node.named_children:
                 fn_node = node.named_children[0]
             if fn_node is None:
-                return ""
+                return ("", "")
             if fn_node.type in ("attribute", "member_expression", "field_expression"):
-                attr = fn_node.child_by_field_name("attribute") or fn_node.child_by_field_name(
-                    "property"
-                ) or fn_node.child_by_field_name("field")
+                attr = (
+                    fn_node.child_by_field_name("attribute")
+                    or fn_node.child_by_field_name("property")
+                    or fn_node.child_by_field_name("field")
+                )
                 if attr is not None:
-                    return source_bytes[attr.start_byte : attr.end_byte].decode(
+                    name_text = source_bytes[attr.start_byte : attr.end_byte].decode(
                         "utf-8", errors="replace"
                     )
+                    obj = (
+                        fn_node.child_by_field_name("object")
+                        or fn_node.child_by_field_name("argument")
+                        or fn_node.child_by_field_name("value")
+                    )
+                    qual_text = (
+                        source_bytes[obj.start_byte : obj.end_byte].decode(
+                            "utf-8", errors="replace"
+                        )
+                        if obj is not None
+                        else ""
+                    )
+                    return (name_text, _leaf_qualifier(qual_text))
             if fn_node.type in ("scoped_identifier", "qualified_identifier"):
                 name_child = fn_node.child_by_field_name("name")
                 if name_child is not None:
-                    return source_bytes[name_child.start_byte : name_child.end_byte].decode(
+                    name_text = source_bytes[name_child.start_byte : name_child.end_byte].decode(
                         "utf-8", errors="replace"
                     )
+                    scope_child = fn_node.child_by_field_name(
+                        "scope"
+                    ) or fn_node.child_by_field_name("path")
+                    qual_text = (
+                        source_bytes[scope_child.start_byte : scope_child.end_byte].decode(
+                            "utf-8", errors="replace"
+                        )
+                        if scope_child is not None
+                        else ""
+                    )
+                    return (name_text, _leaf_qualifier(qual_text))
             text = source_bytes[fn_node.start_byte : fn_node.end_byte].decode(
                 "utf-8", errors="replace"
             )
-            return text.split("::")[-1].split(".")[-1].strip()
+            if "::" in text:
+                prefix, leaf = text.rsplit("::", 1)
+                return (leaf.strip(), _leaf_qualifier(prefix))
+            if "." in text:
+                prefix, leaf = text.rsplit(".", 1)
+                return (leaf.strip(), _leaf_qualifier(prefix))
+            return (text.strip(), "")
 
         def _walk(node: Node) -> None:
             if node.type in _COMMENT_OR_STRING_TYPES:
                 return
             if node.type in _CALL_NODE_TYPES:
-                name = _callee_identifier(node)
+                name, qualifier = _callee_identifier(node)
                 if name and name not in _KEYWORDS and name != chunk.symbol_name:
                     line_no = chunk.line_start + node.start_point[0]
-                    calls.append((name, line_no))
+                    calls.append((name, qualifier, line_no))
             for child in node.children:
                 _walk(child)
 
@@ -324,7 +361,7 @@ class SemanticCPGBuilder:
         self, chunk: ASTChunkNode, src_uri: str, name_to_uris: dict[str, list[str]]
     ) -> None:
         compat_langs = _COMPATIBLE_LANGUAGES.get(chunk.language, frozenset({chunk.language}))
-        for callee_name, line_no in self._extract_calls_ast(chunk):
+        for callee_name, qualifier, line_no in self._extract_calls_ast(chunk):
             candidates = [
                 u
                 for u in name_to_uris.get(callee_name, [])
@@ -333,12 +370,21 @@ class SemanticCPGBuilder:
             ]
             if not candidates:
                 continue
-            same_file = [
-                u
-                for u in candidates
-                if u in self.symbols and self.symbols[u].file_path == chunk.file_path
-            ]
-            targets = same_file if same_file else candidates
+            targets: list[str] = []
+            if qualifier and qualifier not in ("self", "this"):
+                targets = [
+                    u
+                    for u in candidates
+                    if qualifier in self._uri_scopes.get(u, "")
+                    or (u in self.symbols and qualifier in self.symbols[u].file_path)
+                ]
+            if not targets:
+                same_file = [
+                    u
+                    for u in candidates
+                    if u in self.symbols and self.symbols[u].file_path == chunk.file_path
+                ]
+                targets = same_file if same_file else candidates
             for target_uri in targets:
                 self._add_edge(src_uri, target_uri, CPGEdgeKind.CALLS, line=line_no)
 
