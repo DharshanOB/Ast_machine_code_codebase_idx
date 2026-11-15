@@ -42,6 +42,13 @@ _RUST_IMPL_RE = re.compile(r"impl\s+([A-Za-z_][A-Za-z0-9_:]*)\s+for\s+([A-Za-z_]
 _KEYWORDS = frozenset(
     {"if", "else", "for", "while", "switch", "return", "sizeof", "catch", "def", "class", "fn"}
 )
+_COMPATIBLE_LANGUAGES: dict[Language, frozenset[Language]] = {
+    Language.C: frozenset({Language.C, Language.CPP}),
+    Language.CPP: frozenset({Language.C, Language.CPP}),
+    Language.RUST: frozenset({Language.RUST}),
+    Language.PYTHON: frozenset({Language.PYTHON}),
+    Language.JAVASCRIPT: frozenset({Language.JAVASCRIPT}),
+}
 
 
 def make_symbol_uri(
@@ -65,6 +72,7 @@ class SemanticCPGBuilder:
         self.version = version
         self.graph: nx.MultiDiGraph[str] = nx.MultiDiGraph()
         self.symbols: dict[str, SCIPSymbolNode] = {}
+        self._uri_languages: dict[str, Language] = {}
         self._parsers: dict[Language, Parser] = {
             Language.C: Parser(TSLanguage(tree_sitter_c.language())),
             Language.CPP: Parser(TSLanguage(tree_sitter_cpp.language())),
@@ -137,6 +145,7 @@ class SemanticCPGBuilder:
                 documentation=chunk.docstring,
             )
             self._register_symbol(node)
+            self._uri_languages[uri] = chunk.language
             name_to_uris.setdefault(name, []).append(uri)
             chunk_uris.append((chunk, uri))
 
@@ -307,8 +316,14 @@ class SemanticCPGBuilder:
     def _link_calls(
         self, chunk: ASTChunkNode, src_uri: str, name_to_uris: dict[str, list[str]]
     ) -> None:
+        compat_langs = _COMPATIBLE_LANGUAGES.get(chunk.language, frozenset({chunk.language}))
         for callee_name, line_no in self._extract_calls_ast(chunk):
-            candidates = [u for u in name_to_uris.get(callee_name, []) if u != src_uri]
+            candidates = [
+                u
+                for u in name_to_uris.get(callee_name, [])
+                if u != src_uri
+                and (u not in self._uri_languages or self._uri_languages[u] in compat_langs)
+            ]
             if not candidates:
                 continue
             same_file = [

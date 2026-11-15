@@ -136,7 +136,14 @@ class BinaryLifter:
     def __init__(self, clang_bin: str = "clang-18") -> None:
         self.clang_bin = resolve_clang_binary(clang_bin)
         self.rustc_bin = shutil.which("rustc")
+        self._owned_tmp_dirs: list[Path] = []
         BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def cleanup(self) -> None:
+        """Remove any temporary directories created by direct compile_to_object calls."""
+        for tmp_dir in self._owned_tmp_dirs:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        self._owned_tmp_dirs.clear()
 
     def compile_to_object(
         self,
@@ -152,11 +159,12 @@ class BinaryLifter:
 
         src = Path(source_path)
         safe_flags = sanitize_compile_flags(raw_flags or [])
-        target_path = (
-            Path(out_obj_path)
-            if out_obj_path is not None
-            else Path(tempfile.mkdtemp(dir=BUILD_TMP_ROOT)) / f"{src.stem}.o"
-        )
+        if out_obj_path is not None:
+            target_path = Path(out_obj_path)
+        else:
+            tmp_dir = Path(tempfile.mkdtemp(dir=BUILD_TMP_ROOT))
+            self._owned_tmp_dirs.append(tmp_dir)
+            target_path = tmp_dir / f"{src.stem}.o"
         cmd = [
             self.clang_bin,
             "-c",
@@ -190,11 +198,12 @@ class BinaryLifter:
         if self.rustc_bin is None:
             raise RuntimeError("No rustc compiler binary found on PATH")
         src = Path(source_path)
-        target_path = (
-            Path(out_obj_path)
-            if out_obj_path is not None
-            else Path(tempfile.mkdtemp(dir=BUILD_TMP_ROOT)) / f"{src.stem}.o"
-        )
+        if out_obj_path is not None:
+            target_path = Path(out_obj_path)
+        else:
+            tmp_dir = Path(tempfile.mkdtemp(dir=BUILD_TMP_ROOT))
+            self._owned_tmp_dirs.append(tmp_dir)
+            target_path = tmp_dir / f"{src.stem}.o"
         cmd = [
             self.rustc_bin,
             "--crate-type",

@@ -47,6 +47,22 @@ _IGNORED_DIRS: frozenset[str] = frozenset(
 mcp = MCPServer("astraea-code-indexer")
 
 
+def _sanitize_compiler_error(exc: Exception) -> str:
+    """Return a concise failure category without echoing raw compiler stderr or included lines."""
+    msg = str(exc)
+    if "TimeoutExpired" in type(exc).__name__ or "timed out" in msg.lower():
+        return "Compiler subprocess timed out"
+    for prefix in (
+        "Clang IR emission failed",
+        "Rustc IR emission failed",
+        "Object compilation failed",
+        "Rustc object compilation failed",
+    ):
+        if msg.startswith(prefix):
+            return prefix
+    return f"Lowering failed ({type(exc).__name__})"
+
+
 def _truncate_to_token_budget(
     payload: dict[str, Any], token_budget: int = DEFAULT_TOKEN_BUDGET
 ) -> dict[str, Any]:
@@ -136,8 +152,10 @@ class CodeIndexPipeline:
                             )
                         self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
                     except Exception as exc:
-                        file_error = str(exc)
-                        logger.warning("Native C/C++ lowering failed for %s: %s", src_path, exc)
+                        file_error = _sanitize_compiler_error(exc)
+                        logger.warning(
+                            "Native C/C++ lowering failed for %s: %s", src_path, file_error
+                        )
             elif lang == Language.RUST:
                 if self.ir_pass.rustc_bin is None:
                     file_error = "rustc binary not found on PATH"
@@ -157,8 +175,8 @@ class CodeIndexPipeline:
                             )
                         self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
                     except Exception as exc:
-                        file_error = str(exc)
-                        logger.warning("Rust lowering failed for %s: %s", src_path, exc)
+                        file_error = _sanitize_compiler_error(exc)
+                        logger.warning("Rust lowering failed for %s: %s", src_path, file_error)
             elif lang == Language.PYTHON:
                 try:
                     ir_by_fn, bin_by_fn = lower_python_file(src_path)

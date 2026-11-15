@@ -551,6 +551,13 @@ def resolve_merge_base(repo: Path, base_ref: str, head_ref: str) -> str:
     )
     if proc.returncode == 0 and proc.stdout.strip():
         return proc.stdout.strip()
+    logger.warning(
+        "git merge-base failed for %s..%s (rc=%d); falling back to %s",
+        base_ref,
+        head_ref,
+        proc.returncode,
+        base_ref,
+    )
     return base_ref
 
 
@@ -575,19 +582,16 @@ def analyze_git_pr(
     with tempfile.TemporaryDirectory(prefix="astraea-pr-") as tmp_root:
         base_wt = Path(tmp_root) / "base"
         head_wt = Path(tmp_root) / "head"
-        subprocess.run(
-            ["git", "-C", str(repo), "worktree", "add", "--detach", str(base_wt), effective_base],
-            shell=False,
-            capture_output=True,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "-C", str(repo), "worktree", "add", "--detach", str(head_wt), head_ref],
-            shell=False,
-            capture_output=True,
-            check=True,
-        )
+        added_worktrees: list[Path] = []
         try:
+            for wt_path, ref in ((base_wt, effective_base), (head_wt, head_ref)):
+                subprocess.run(
+                    ["git", "-C", str(repo), "worktree", "add", "--detach", str(wt_path), ref],
+                    shell=False,
+                    capture_output=True,
+                    check=True,
+                )
+                added_worktrees.append(wt_path)
             return analyze_pr_directories(
                 base_dir=base_wt,
                 head_dir=head_wt,
@@ -597,16 +601,12 @@ def analyze_git_pr(
                 compile_commands_path=cc_path,
             )
         finally:
-            subprocess.run(
-                ["git", "-C", str(repo), "worktree", "remove", "--force", str(base_wt)],
-                shell=False,
-                capture_output=True,
-            )
-            subprocess.run(
-                ["git", "-C", str(repo), "worktree", "remove", "--force", str(head_wt)],
-                shell=False,
-                capture_output=True,
-            )
+            for wt_path in added_worktrees:
+                subprocess.run(
+                    ["git", "-C", str(repo), "worktree", "remove", "--force", str(wt_path)],
+                    shell=False,
+                    capture_output=True,
+                )
 
 
 def _cluster_clones(clone_pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:

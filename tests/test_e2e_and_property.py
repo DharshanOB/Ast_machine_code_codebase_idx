@@ -101,6 +101,48 @@ def test_cpg_ignores_calls_in_comments_and_strings() -> None:
     assert cpg.k_hop_slice(caller_uri, max_hops=1) == []
 
 
+def test_cpg_restricts_calls_to_compatible_languages() -> None:
+    """Verify a C call to helper() does not link to an unrelated Python helper()."""
+    chunker = ASTChunker()
+    c_chunks = chunker.chunk_file(
+        "mod.c", source="int helper(int x);\nint run(int x) { return helper(x); }\n"
+    )
+    py_chunks = chunker.chunk_file("other.py", source="def helper(x: int) -> int:\n    return x\n")
+
+    cpg = SemanticCPGBuilder()
+    symbols = cpg.build_from_ast_chunks(c_chunks + py_chunks)
+    run_uri = next(u for u, s in symbols.items() if s.display_name == "run")
+    assert cpg.k_hop_slice(run_uri, max_hops=1) == []
+
+
+def test_binary_lifter_cleanup_removes_owned_tmp_dirs(tmp_path: Path) -> None:
+    """Verify BinaryLifter.cleanup() removes temp dirs created by direct compile_to_object()."""
+    from indexer.llvm_ir_pass import resolve_clang_binary
+
+    if resolve_clang_binary() is None:
+        return
+    c_file = tmp_path / "ok.c"
+    c_file.write_text("int ok(int x) { return x + 1; }\n", encoding="utf-8")
+    lifter = BinaryLifter()
+    obj_path = lifter.compile_to_object(c_file)
+    assert obj_path.exists()
+    lifter.cleanup()
+    assert not obj_path.parent.exists()
+
+
+def test_degraded_reason_sanitizes_compiler_source_echo(tmp_path: Path) -> None:
+    """Verify degraded_reason does not echo raw #included file contents."""
+    secret_hdr = tmp_path / "secret.h"
+    secret_hdr.write_text("SECRET_TOKEN_SHOULD_NOT_LEAK\n", encoding="utf-8")
+    bad_c = tmp_path / "bad.c"
+    bad_c.write_text('#include "secret.h"\nint f(void) { return 0; }\n', encoding="utf-8")
+
+    pipeline = CodeIndexPipeline()
+    pipeline.index_workspace(tmp_path)
+    inspected = pipeline.inspect_lowering_pipeline("f")
+    assert "SECRET_TOKEN_SHOULD_NOT_LEAK" not in inspected.get("degraded_reason", "")
+
+
 def test_mcp_tools_registered() -> None:
     """Verify all 5 MCP tools are registered on MCPServer."""
     tool_names = {t.name for t in mcp._tool_manager.list_tools()}
