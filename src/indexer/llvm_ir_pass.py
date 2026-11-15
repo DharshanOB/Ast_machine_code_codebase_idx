@@ -123,18 +123,7 @@ class LLVMIRPass:
             if target_triple:
                 cmd.extend(["-target", target_triple])
             cmd.extend([str(src), "-o", str(out_ll)])
-
-            proc = subprocess.run(
-                cmd,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=MAX_COMPILER_TIMEOUT_S,
-                preexec_fn=_apply_resource_limits if os.name == "posix" else None,
-            )
-            if proc.returncode != 0 or not out_ll.exists():
-                raise RuntimeError(f"Clang IR emission failed: {proc.stderr.strip()}")
-            return out_ll.read_text(encoding="utf-8", errors="replace")
+            return self._run_ir_compiler(cmd, out_ll, "Clang")
 
     def compile_rust_to_ir(self, source_path: str | Path) -> str:
         """Compile a standalone Rust file to LLVM IR text via rustc."""
@@ -156,17 +145,22 @@ class LLVMIRPass:
                 "-o",
                 str(out_ll),
             ]
-            proc = subprocess.run(
-                cmd,
-                shell=False,
-                capture_output=True,
-                text=True,
-                timeout=MAX_COMPILER_TIMEOUT_S,
-                preexec_fn=_apply_resource_limits if os.name == "posix" else None,
-            )
-            if proc.returncode != 0 or not out_ll.exists():
-                raise RuntimeError(f"Rustc IR emission failed: {proc.stderr.strip()}")
-            return out_ll.read_text(encoding="utf-8", errors="replace")
+            return self._run_ir_compiler(cmd, out_ll, "Rustc")
+
+    @staticmethod
+    def _run_ir_compiler(cmd: list[str], out_ll: Path, label: str) -> str:
+        """Execute an IR-emitting compiler subprocess with resource limits."""
+        proc = subprocess.run(
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=MAX_COMPILER_TIMEOUT_S,
+            preexec_fn=_apply_resource_limits if os.name == "posix" else None,
+        )
+        if proc.returncode != 0 or not out_ll.exists():
+            raise RuntimeError(f"{label} IR emission failed: {proc.stderr.strip()}")
+        return out_ll.read_text(encoding="utf-8", errors="replace")
 
     def parse_ir_module(self, ir_text: str, source_file: str = "<memory>") -> list[LLVMIRGraph]:
         """Parse LLVM IR assembly text into per-function ProGraML LLVMIRGraph models."""

@@ -527,12 +527,18 @@ def analyze_repository(
                 )
             )
 
+        if is_container:
+            continue
         modality = "ir_structural" if unit.ir_status == IRStatus.OK else "ast_dense"
         for cid, score in pipe.store.find_clones(
             unit.unit_id, modality=modality, threshold=clone_threshold, top_k=2
         ):
             other = pipe.store.units.get(cid)
-            if other is None or _is_nested_chunk(ast, other.ast_chunk):
+            if (
+                other is None
+                or other.ast_chunk.node_kind in _CONTAINER_NODE_TYPES
+                or _is_nested_chunk(ast, other.ast_chunk)
+            ):
                 continue
             other_name = other.ast_chunk.symbol_name or "<anonymous>"
             if other_name == sym_name:
