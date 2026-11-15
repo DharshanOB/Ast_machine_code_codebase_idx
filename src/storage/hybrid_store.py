@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -130,6 +131,7 @@ class HybridCodeStore:
         self.unit_vectors: dict[str, dict[str, list[float]]] = {}
         self.graph: nx.MultiDiGraph[str] = nx.MultiDiGraph()
         self._point_ids: dict[str, int] = {}
+        self._lock = threading.RLock()
 
         if self.storage_dir is not None:
             self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -210,10 +212,44 @@ class HybridCodeStore:
         )
         return doc, vectors, pid, point
 
+    def _add_units_to_memory(
+        self,
+        staged_units: dict[str, UnifiedCodeUnit],
+        staged_vectors: dict[str, dict[str, list[float]]],
+        staged_point_ids: dict[str, int],
+        commit_sha: str,
+    ) -> None:
+        """Update in-memory unit maps and property graph for upserted units."""
+        for uid, unit in staged_units.items():
+            self.units[uid] = unit
+            self.unit_vectors[uid] = staged_vectors[uid]
+            self._point_ids[uid] = staged_point_ids[uid]
+            ast = unit.ast_chunk
+            self.graph.add_node(
+                uid,
+                symbol_name=ast.symbol_name,
+                file_path=ast.file_path,
+                commit_sha=commit_sha,
+            )
+            if unit.scip_symbol is not None:
+                for edge in unit.scip_symbol.edges:
+                    self.graph.add_edge(
+                        edge.source_id,
+                        edge.target_id,
+                        kind=edge.kind.value,
+                        line=edge.line,
+                    )
+
     def upsert_units(
         self, units: list[UnifiedCodeUnit], commit_sha: str = "working-tree"
     ) -> int:
         """Atomically index a batch of UnifiedCodeUnits across all three modalities."""
+        with self._lock:
+            return self._upsert_units_locked(units, commit_sha=commit_sha)
+
+    def _upsert_units_locked(
+        self, units: list[UnifiedCodeUnit], commit_sha: str = "working-tree"
+    ) -> int:
         if not units:
             return 0
 
@@ -238,30 +274,15 @@ class HybridCodeStore:
         writer.commit()
         self._tantivy_index.reload()
         self._qdrant.upsert(collection_name=self.COLLECTION_NAME, points=qdrant_points)
-
-        for uid, unit in staged_units.items():
-            self.units[uid] = unit
-            self.unit_vectors[uid] = staged_vectors[uid]
-            self._point_ids[uid] = staged_point_ids[uid]
-            ast = unit.ast_chunk
-            self.graph.add_node(
-                uid,
-                symbol_name=ast.symbol_name,
-                file_path=ast.file_path,
-                commit_sha=commit_sha,
-            )
-            if unit.scip_symbol is not None:
-                for edge in unit.scip_symbol.edges:
-                    self.graph.add_edge(
-                        edge.source_id,
-                        edge.target_id,
-                        kind=edge.kind.value,
-                        line=edge.line,
-                    )
+        self._add_units_to_memory(staged_units, staged_vectors, staged_point_ids, commit_sha)
         return len(units)
 
     def delete_units(self, unit_ids: list[str]) -> int:
         """Delete stale/removed units across SQLite, Tantivy, Qdrant, and in-memory state."""
+        with self._lock:
+            return self._delete_units_locked(unit_ids)
+
+    def _delete_units_locked(self, unit_ids: list[str]) -> int:
         if not unit_ids:
             return 0
 
@@ -306,6 +327,141 @@ class HybridCodeStore:
                     [(u,) for u in unit_ids],
                 )
         return removed
+
+    def apply_batch(
+        self,
+        upsert_units: list[UnifiedCodeUnit],
+        delete_unit_ids: list[str],
+        save_file_states: dict[str, tuple[str, list[str]]] | None = None,
+        delete_file_paths: list[str] | None = None,
+        commit_sha: str = "working-tree",
+    ) -> tuple[int, int]:
+        """Atomically apply upserts, deletes, and file_state updates across all stores."""
+        with self._lock:
+            return self._apply_batch_locked(
+                upsert_units=upsert_units,
+                delete_unit_ids=delete_unit_ids,
+                save_file_states=save_file_states,
+                delete_file_paths=delete_file_paths,
+                commit_sha=commit_sha,
+            )
+
+    def _apply_batch_locked(
+        self,
+        upsert_units: list[UnifiedCodeUnit],
+        delete_unit_ids: list[str],
+        save_file_states: dict[str, tuple[str, list[str]]] | None = None,
+        delete_file_paths: list[str] | None = None,
+        commit_sha: str = "working-tree",
+    ) -> tuple[int, int]:
+        if (
+            not upsert_units
+            and not delete_unit_ids
+            and not save_file_states
+            and not delete_file_paths
+        ):
+            return 0, 0
+
+        if self._db_path is not None:
+            with sqlite3.connect(self._db_path) as conn:
+                if delete_unit_ids:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO tombstones (unit_id) VALUES (?)",
+                        [(u,) for u in delete_unit_ids],
+                    )
+                    conn.executemany(
+                        "DELETE FROM units WHERE unit_id = ?",
+                        [(u,) for u in delete_unit_ids],
+                    )
+                if upsert_units:
+                    payload = json.dumps([u.model_dump(mode="json") for u in upsert_units])
+                    unit_rows = [(u.unit_id, commit_sha, u.model_dump_json()) for u in upsert_units]
+                    upserted_ids = [u.unit_id for u in upsert_units]
+                    conn.execute(
+                        "INSERT OR REPLACE INTO snapshots (commit_sha, payload_json) VALUES (?, ?)",
+                        (commit_sha, payload),
+                    )
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO units (unit_id, commit_sha, unit_json)"
+                        " VALUES (?, ?, ?)",
+                        unit_rows,
+                    )
+                    for idx in range(0, len(upserted_ids), 500):
+                        batch = upserted_ids[idx : idx + 500]
+                        placeholders = ",".join("?" for _ in batch)
+                        conn.execute(
+                            f"DELETE FROM tombstones WHERE unit_id IN ({placeholders})",
+                            batch,
+                        )
+                if save_file_states:
+                    file_rows = [
+                        (fp, content_hash, json.dumps(unit_ids))
+                        for fp, (content_hash, unit_ids) in save_file_states.items()
+                    ]
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO file_state (file_path, content_hash, unit_ids_json)
+                        VALUES (?, ?, ?)
+                        """,
+                        file_rows,
+                    )
+                if delete_file_paths:
+                    conn.executemany(
+                        "DELETE FROM file_state WHERE file_path = ?",
+                        [(fp,) for fp in delete_file_paths],
+                    )
+
+        staged_units: dict[str, UnifiedCodeUnit] = {}
+        staged_vectors: dict[str, dict[str, list[float]]] = {}
+        staged_point_ids: dict[str, int] = {}
+        qdrant_points: list[PointStruct] = []
+        delete_point_ids: list[int | str | UUID] = []
+
+        if delete_unit_ids or upsert_units:
+            writer = self._tantivy_index.writer()
+            for uid in delete_unit_ids:
+                writer.delete_documents_by_term("unit_id", uid)
+                delete_point_ids.append(self._point_ids.get(uid, self._unit_point_id(uid)))
+            for unit in upsert_units:
+                staged_units[unit.unit_id] = unit
+                doc, vectors, pid, point = self._prepare_unit_index_data(unit)
+                writer.delete_documents_by_term("unit_id", unit.unit_id)
+                writer.add_document(doc)
+                staged_vectors[unit.unit_id] = vectors
+                staged_point_ids[unit.unit_id] = pid
+                qdrant_points.append(point)
+            writer.commit()
+            self._tantivy_index.reload()
+
+            if delete_point_ids:
+                self._qdrant.delete(
+                    collection_name=self.COLLECTION_NAME,
+                    points_selector=PointIdsList(points=delete_point_ids),
+                )
+            if qdrant_points:
+                self._qdrant.upsert(collection_name=self.COLLECTION_NAME, points=qdrant_points)
+
+        removed_count = 0
+        for uid in delete_unit_ids:
+            self._point_ids.pop(uid, None)
+            if uid in self.units:
+                self.units.pop(uid, None)
+                self.unit_vectors.pop(uid, None)
+                if uid in self.graph:
+                    self.graph.remove_node(uid)
+                removed_count += 1
+
+        if staged_units:
+            self._add_units_to_memory(staged_units, staged_vectors, staged_point_ids, commit_sha)
+
+        if self._db_path is not None and delete_unit_ids:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.executemany(
+                    "DELETE FROM tombstones WHERE unit_id = ?",
+                    [(u,) for u in delete_unit_ids],
+                )
+
+        return len(upsert_units), removed_count
 
     def recover_from_sqlite(self) -> int:
         """Reload units from SQLite, replay tombstones, and reconcile Tantivy/Qdrant."""
@@ -476,6 +632,72 @@ class HybridCodeStore:
             "sqlite": sqlite_count,
         }
 
+    def health_check(self) -> dict[str, Any]:
+        """Return consistency counts, pending tombstone count, and SQLite health status."""
+        pending_tombstones = 0
+        sqlite_ok = True
+        if self._db_path is not None:
+            if not self._db_path.exists():
+                sqlite_ok = False
+            else:
+                try:
+                    with sqlite3.connect(self._db_path) as conn:
+                        tomb_row = conn.execute("SELECT COUNT(*) FROM tombstones").fetchone()
+                        pending_tombstones = int(tomb_row[0]) if tomb_row else 0
+                        check_row = conn.execute("PRAGMA quick_check").fetchone()
+                        sqlite_ok = bool(check_row and str(check_row[0]) == "ok")
+                except sqlite3.Error:
+                    sqlite_ok = False
+        try:
+            report = self.verify_consistency()
+        except sqlite3.Error:
+            sqlite_ok = False
+            qdrant_info = self._qdrant.get_collection(self.COLLECTION_NAME)
+            report = {
+                "consistent": False,
+                "memory": len(self.units),
+                "tantivy": self._tantivy_index.searcher().num_docs,
+                "qdrant": int(qdrant_info.points_count or 0),
+                "sqlite": 0,
+            }
+        report["pending_tombstones"] = pending_tombstones
+        report["sqlite_ok"] = sqlite_ok
+        return report
+
+    def backup_sqlite(self, dest_path: str | Path) -> Path:
+        """Back up the SQLite snapshot database to dest_path using sqlite3.Connection.backup."""
+        if self._db_path is None:
+            raise RuntimeError("Cannot backup SQLite: store has no storage_dir")
+        if not self._db_path.exists():
+            raise FileNotFoundError(f"SQLite database not found: {self._db_path}")
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src_conn = sqlite3.connect(self._db_path)
+        dst_conn = sqlite3.connect(dest)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+        return dest
+
+    def restore_sqlite(self, src_path: str | Path) -> int:
+        """Restore the SQLite database from src_path and recover all store modalities."""
+        if self._db_path is None:
+            raise RuntimeError("Cannot restore SQLite: store has no storage_dir")
+        src = Path(src_path)
+        if not src.exists():
+            raise FileNotFoundError(f"Backup SQLite file not found: {src}")
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        src_conn = sqlite3.connect(src)
+        dst_conn = sqlite3.connect(self._db_path)
+        try:
+            src_conn.backup(dst_conn)
+        finally:
+            dst_conn.close()
+            src_conn.close()
+        return self.recover_from_sqlite()
+
     def rrf_search(
         self,
         query: str,
@@ -484,6 +706,18 @@ class HybridCodeStore:
         weights: dict[str, float] | None = None,
     ) -> list[SearchHit]:
         """Execute hybrid search with Weighted Reciprocal Rank Fusion across modalities."""
+        with self._lock:
+            return self._rrf_search_locked(
+                query=query, layers=layers, top_k=top_k, weights=weights
+            )
+
+    def _rrf_search_locked(
+        self,
+        query: str,
+        layers: list[str] | None = None,
+        top_k: int = 10,
+        weights: dict[str, float] | None = None,
+    ) -> list[SearchHit]:
         active = set(layers or ["lex", "ast_vec", "ir_gnn", "bin_cfg"])
         w = weights or {"lex": 1.0, "ast_vec": 1.0, "ir_gnn": 0.9, "bin_cfg": 0.8}
         ranks_by_unit: dict[str, dict[str, int]] = {}

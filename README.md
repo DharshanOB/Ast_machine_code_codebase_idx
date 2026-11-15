@@ -76,6 +76,24 @@ Runs the stdio Model Context Protocol server exposing multi-layer indexing and k
 astraea-index
 ```
 
+## Language Support & Limitations
+
+| Language | Supported Layers | Notes & Limitations |
+| :--- | :--- | :--- |
+| **C / C++ / Rust** | Tree-sitter AST, CPG, LLVM IR, ELF/DWARF | Lowered as standalone translation units without full Cargo or CMake build graphs; external headers, crate dependencies, or custom build flags may degrade IR/binary lowering. |
+| **Python** | Tree-sitter AST, CPG, `dis` bytecode CFG | Bytecode control-flow graphs are extracted via standard-library `dis` without native ELF/DWARF lowering. |
+| **JavaScript** | Tree-sitter AST, CPG | IR and machine-code layers report `IRStatus.NOT_APPLICABLE`. |
+
+Dynamic dispatch, C++ template instantiation across translation units, and macro-expanded call sites remain heuristic unless a SCIP index or LLVM IR confirmation is available.
+
+## Backup, Restore & Health Diagnostics
+
+`HybridCodeStore` provides diagnostics and recovery primitives for its SQLite, Tantivy, and Qdrant backends:
+
+- `HybridCodeStore.health_check()` (and the `get_index_health` MCP tool): reports backend status, vector/document counts, and pending tombstones.
+- `backup_sqlite(dest_path)` / `restore_sqlite(src_path)`: creates and restores consistent SQLite index snapshots.
+- `recover_from_sqlite()`: replays SQLite tombstones and reconciles Tantivy and Qdrant state with SQLite.
+
 ## Development Checks
 
 ```bash

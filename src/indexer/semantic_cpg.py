@@ -235,6 +235,8 @@ class SemanticCPGBuilder:
         kind: CPGEdgeKind,
         line: int | None = None,
         metadata: dict[str, str] | None = None,
+        confidence: str = "heuristic",
+        evidence: str = "",
     ) -> None:
         self.graph.add_edge(
             source_id,
@@ -242,6 +244,8 @@ class SemanticCPGBuilder:
             kind=kind.value,
             line=line,
             metadata=metadata or {},
+            confidence=confidence,
+            evidence=evidence,
         )
         if source_id in self.symbols:
             self.symbols[source_id].edges.append(
@@ -251,6 +255,8 @@ class SemanticCPGBuilder:
                     kind=kind,
                     line=line,
                     metadata=metadata or {},
+                    confidence=confidence,
+                    evidence=evidence,
                 )
             )
 
@@ -371,6 +377,7 @@ class SemanticCPGBuilder:
             if not candidates:
                 continue
             targets: list[str] = []
+            qualifier_matched = False
             if qualifier and qualifier not in ("self", "this"):
                 targets = [
                     u
@@ -378,6 +385,7 @@ class SemanticCPGBuilder:
                     if qualifier in self._uri_scopes.get(u, "")
                     or (u in self.symbols and qualifier in self.symbols[u].file_path)
                 ]
+                qualifier_matched = bool(targets)
             if not targets:
                 same_file = [
                     u
@@ -385,8 +393,23 @@ class SemanticCPGBuilder:
                     if u in self.symbols and self.symbols[u].file_path == chunk.file_path
                 ]
                 targets = same_file if same_file else candidates
+            if len(targets) > 1:
+                confidence = "ambiguous"
+                evidence = "ast_call_multiple_candidates"
+            else:
+                confidence = "heuristic"
+                evidence = (
+                    "ast_call_qualified" if qualifier_matched else "ast_call_single_candidate"
+                )
             for target_uri in targets:
-                self._add_edge(src_uri, target_uri, CPGEdgeKind.CALLS, line=line_no)
+                self._add_edge(
+                    src_uri,
+                    target_uri,
+                    CPGEdgeKind.CALLS,
+                    line=line_no,
+                    confidence=confidence,
+                    evidence=evidence,
+                )
 
     def _link_inheritance(
         self, chunk: ASTChunkNode, src_uri: str, name_to_uris: dict[str, list[str]]
@@ -453,15 +476,31 @@ class SemanticCPGBuilder:
                             ir_calls.add((caller, callee))
 
         cpg_calls: set[tuple[str, str]] = set()
+        ambiguous_calls: set[tuple[str, str]] = set()
         for src_uri, dst_uri, data in self.graph.edges(data=True):
             if data.get("kind") == CPGEdgeKind.CALLS.value:
                 src_sym = self.symbols.get(src_uri)
                 dst_sym = self.symbols.get(dst_uri)
                 if src_sym and dst_sym:
-                    cpg_calls.add((src_sym.display_name, dst_sym.display_name))
+                    pair = (src_sym.display_name, dst_sym.display_name)
+                    cpg_calls.add(pair)
+                    if pair in ir_calls:
+                        data["confidence"] = "confirmed"
+                        data["evidence"] = "llvm_ir_call"
+                    elif data.get("confidence") == "ambiguous":
+                        ambiguous_calls.add(pair)
+
+        for sym in self.symbols.values():
+            for edge in sym.edges:
+                if edge.kind == CPGEdgeKind.CALLS:
+                    dst_sym = self.symbols.get(edge.target_id)
+                    if dst_sym and (sym.display_name, dst_sym.display_name) in ir_calls:
+                        edge.confidence = "confirmed"
+                        edge.evidence = "llvm_ir_call"
 
         return {
             "confirmed": sorted(cpg_calls & ir_calls),
             "cpg_only": sorted(cpg_calls - ir_calls),
             "ir_only": sorted(ir_calls - cpg_calls),
+            "ambiguous": sorted(ambiguous_calls),
         }

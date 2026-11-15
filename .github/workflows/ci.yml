@@ -34,3 +34,6 @@ jobs:
 
       - name: Run Pytest suite
         run: pytest -v --tb=short
+
+      - name: Run benchmark threshold check
+        run: PYTHONPATH=src python benchmarks/bench_astraea.py --check-thresholds

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
+import re
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -46,6 +49,60 @@ _IGNORED_DIRS: frozenset[str] = frozenset(
 )
 
 mcp = MCPServer("astraea-code-indexer")
+
+_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+
+
+@functools.lru_cache(maxsize=16)
+def _get_compiler_version(bin_path: str | None) -> str:
+    """Return the first line of `<bin_path> --version`, or empty string if unavailable."""
+    if not bin_path:
+        return ""
+    try:
+        proc = subprocess.run(
+            [bin_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    output = (proc.stdout or proc.stderr or "").strip()
+    return output.splitlines()[0].strip() if output else ""
+
+
+def _transitive_include_hashes(
+    src_path: Path, root: Path, seen: set[Path] | None = None
+) -> list[str]:
+    """Recursively collect SHA-256 digests of `#include "..."` headers inside root."""
+    if seen is None:
+        seen = set()
+    src_resolved = src_path.resolve()
+    if src_resolved in seen:
+        return []
+    seen.add(src_resolved)
+
+    root_resolved = root.resolve()
+    try:
+        text = src_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+
+    digests: list[str] = []
+    for match in _INCLUDE_RE.finditer(text):
+        inc_path = (src_path.parent / match.group(1)).resolve()
+        if not inc_path.is_file() or not inc_path.is_relative_to(root_resolved):
+            continue
+        if inc_path in seen:
+            continue
+        try:
+            digests.append(hashlib.sha256(inc_path.read_bytes()).hexdigest())
+        except OSError:
+            continue
+        digests.extend(_transitive_include_hashes(inc_path, root_resolved, seen))
+    return digests
 
 
 def _sanitize_compiler_error(exc: Exception) -> str:
@@ -115,6 +172,9 @@ class CodeIndexPipeline:
                 self.symbol_to_unit[unit.scip_symbol.symbol_uri] = unit.unit_id
             if unit.ast_chunk.symbol_name:
                 self.symbol_to_unit[unit.ast_chunk.symbol_name] = unit.unit_id
+        if self._file_chunks:
+            all_chunks = [c for cl in self._file_chunks.values() for c in cl]
+            self.cpg.build_from_ast_chunks(all_chunks)
 
     def index_workspace(
         self,
@@ -146,8 +206,21 @@ class CodeIndexPipeline:
                 compiler_bin = self.ir_pass.clang_bin or ""
             elif lang == Language.RUST:
                 compiler_bin = self.ir_pass.rustc_bin or ""
+            compiler_ver = _get_compiler_version(compiler_bin or None)
+            include_hashes = (
+                _transitive_include_hashes(file_path, root)
+                if lang in (Language.C, Language.CPP)
+                else []
+            )
             hasher.update(
-                b"\0" + json.dumps(flags).encode("utf-8") + b"\0" + compiler_bin.encode("utf-8")
+                b"\0"
+                + json.dumps(flags).encode("utf-8")
+                + b"\0"
+                + compiler_bin.encode("utf-8")
+                + b"\0"
+                + compiler_ver.encode("utf-8")
+                + b"\0"
+                + json.dumps(include_hashes).encode("utf-8")
             )
             digest = hasher.hexdigest()
             current_files[str(file_path)] = (file_path, digest)
@@ -158,8 +231,6 @@ class CodeIndexPipeline:
             self._file_hashes.pop(p, None)
             self._file_chunks.pop(p, None)
             stale_unit_ids.extend(self._file_unit_ids.pop(p, []))
-        if deleted_paths:
-            self.store.delete_file_state(deleted_paths)
 
         changed_files: dict[Path, list[ASTChunkNode]] = {}
         updated_paths: list[str] = []
@@ -183,7 +254,6 @@ class CodeIndexPipeline:
             self.symbol_to_unit = {
                 k: v for k, v in self.symbol_to_unit.items() if v not in stale_set
             }
-        deleted_count = self.store.delete_units(stale_unit_ids)
         all_chunks = [c for chunk_list in self._file_chunks.values() for c in chunk_list]
         self.cpg = SemanticCPGBuilder()
         symbols = self.cpg.build_from_ast_chunks(all_chunks)
@@ -288,14 +358,16 @@ class CodeIndexPipeline:
                 if chunk.symbol_name:
                     self.symbol_to_unit[chunk.symbol_name] = unit.unit_id
 
-        count = self.store.upsert_units(units)
-        if updated_paths:
-            self.store.save_file_state(
-                {
-                    p_str: (self._file_hashes[p_str], self._file_unit_ids.get(p_str, []))
-                    for p_str in updated_paths
-                }
-            )
+        updated_file_states = {
+            p_str: (self._file_hashes[p_str], self._file_unit_ids.get(p_str, []))
+            for p_str in updated_paths
+        }
+        count, deleted_count = self.store.apply_batch(
+            upsert_units=units,
+            delete_unit_ids=stale_unit_ids,
+            save_file_states=updated_file_states,
+            delete_file_paths=deleted_paths,
+        )
 
         seen_ir_ids: set[int] = set()
         all_ir_graphs: list[LLVMIRGraph] = []
@@ -319,6 +391,7 @@ class CodeIndexPipeline:
                 "confirmed": len(ir_cpg_validation["confirmed"]),
                 "cpg_only": len(ir_cpg_validation["cpg_only"]),
                 "ir_only": len(ir_cpg_validation["ir_only"]),
+                "ambiguous": len(ir_cpg_validation["ambiguous"]),
             },
         }
 
@@ -438,6 +511,16 @@ def find_ir_or_binary_clones(
 def trace_symbol_dataflow(symbol_id: str, max_hops: int = 2) -> list[dict[str, Any]]:
     """Trace cycle-safe k-hop caller/callee and data-flow edges for a SCIP symbol URI."""
     return _PIPELINE.cpg.k_hop_slice(symbol_id, max_hops=max_hops)
+
+
+@mcp.tool()
+def get_index_health() -> dict[str, Any]:
+    """Return storage consistency, SQLite health, and CPG symbol/edge counts."""
+    return {
+        **_PIPELINE.store.health_check(),
+        "cpg_symbols": len(_PIPELINE.cpg.symbols),
+        "cpg_edges": _PIPELINE.cpg.graph.number_of_edges(),
+    }
 
 
 def main() -> None:

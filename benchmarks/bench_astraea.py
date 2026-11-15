@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import math
 import re
 import tempfile
 import time
@@ -297,6 +299,123 @@ def run_indexing_and_search_benchmark(num_files: int = 40) -> dict[str, float]:
         }
 
 
+_REAL_REPO_QUERIES: tuple[str, ...] = (
+    "ASTChunker",
+    "SemanticCPGBuilder",
+    "HybridCodeStore",
+    "rrf_search",
+    "index_workspace",
+    "CodeIndexPipeline",
+    "LLVMIRPass",
+    "BinaryLifter",
+    "DWARFAligner",
+    "detect_language",
+    "build_from_ast_chunks",
+    "validate_against_ir_calls",
+    "cross_language",
+    "sqlite",
+    "tantivy",
+    "qdrant",
+    "embedding",
+    "symbol_uri",
+    "compile_commands",
+    "call_graph",
+)
+
+
+def run_real_repo_benchmark(repo_path: str | Path = ".") -> dict[str, float]:
+    """Benchmark cold/incremental indexing, p95 RRF retrieval, and storage on a real repo."""
+    target = Path(repo_path).resolve()
+    with tempfile.TemporaryDirectory() as tmp:
+        storage_dir = Path(tmp) / "storage"
+        pipe = CodeIndexPipeline(storage_dir=storage_dir)
+
+        t0 = time.perf_counter()
+        cold_stats = pipe.index_workspace(target, incremental=False)
+        cold_index_ms = (time.perf_counter() - t0) * 1000.0
+
+        t1 = time.perf_counter()
+        pipe.index_workspace(target, incremental=True)
+        incremental_noop_ms = (time.perf_counter() - t1) * 1000.0
+
+        incremental_speedup = cold_index_ms / max(incremental_noop_ms, 0.01)
+
+        latencies_ms: list[float] = []
+        for query in _REAL_REPO_QUERIES:
+            tq = time.perf_counter()
+            pipe.store.rrf_search(query, top_k=5)
+            latencies_ms.append((time.perf_counter() - tq) * 1000.0)
+
+        sorted_latencies = sorted(latencies_ms)
+        p95_idx = min(
+            len(sorted_latencies) - 1,
+            max(0, math.ceil(0.95 * len(sorted_latencies)) - 1),
+        )
+        retrieval_p95_ms = sorted_latencies[p95_idx]
+
+        storage_bytes = float(
+            sum(p.stat().st_size for p in storage_dir.rglob("*") if p.is_file())
+        )
+        indexed_units = float(cold_stats.get("indexed_units", 0))
+
+        return {
+            "cold_index_ms": round(cold_index_ms, 2),
+            "incremental_noop_ms": round(incremental_noop_ms, 2),
+            "incremental_speedup": round(incremental_speedup, 2),
+            "retrieval_p95_ms": round(retrieval_p95_ms, 2),
+            "storage_bytes": storage_bytes,
+            "indexed_units": indexed_units,
+        }
+
+
+def _check_thresholds(
+    accuracy: dict[str, dict[str, float]],
+    real_repo: dict[str, float],
+) -> None:
+    """Assert accuracy, isolation, and retrieval latency thresholds."""
+    for lang in _INCOMPATIBLE_CHECK_LANGS:
+        metrics = accuracy[lang.value]
+        assert metrics["symbol_recall"] >= 0.95, (
+            f"{lang.value} symbol_recall {metrics['symbol_recall']} < 0.95"
+        )
+        assert metrics["precision"] >= 0.95, (
+            f"{lang.value} precision {metrics['precision']} < 0.95"
+        )
+        assert metrics["recall"] >= 0.95, (
+            f"{lang.value} recall {metrics['recall']} < 0.95"
+        )
+
+    violations = accuracy["cross_language_isolation"]["violations"]
+    assert violations == 0.0, f"cross_language_isolation violations {violations} != 0.0"
+
+    retrieval_p95_ms = real_repo["retrieval_p95_ms"]
+    assert retrieval_p95_ms <= 500.0, f"retrieval_p95_ms {retrieval_p95_ms} > 500.0"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run Astraea benchmarks and optionally enforce CI thresholds."""
+    parser = argparse.ArgumentParser(description="Astraea performance & accuracy benchmarks.")
+    parser.add_argument(
+        "--check-thresholds",
+        action="store_true",
+        help="Assert accuracy, isolation, and p95 retrieval latency thresholds.",
+    )
+    args = parser.parse_args(argv)
+
+    accuracy = run_cross_language_accuracy_benchmark()
+    indexing = run_indexing_and_search_benchmark()
+    real_repo = run_real_repo_benchmark(".")
+
+    print("Cross-language CPG accuracy:", accuracy)
+    print("Indexing & search timings (ms):", indexing)
+    print("Real-repo benchmark:", real_repo)
+
+    if args.check_thresholds:
+        _check_thresholds(accuracy, real_repo)
+        print("All benchmark thresholds passed.")
+
+    return 0
+
+
 if __name__ == "__main__":
-    print("Cross-language CPG accuracy:", run_cross_language_accuracy_benchmark())
-    print("Indexing & search timings (ms):", run_indexing_and_search_benchmark())
+    raise SystemExit(main())

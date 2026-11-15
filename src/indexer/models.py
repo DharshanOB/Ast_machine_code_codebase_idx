@@ -83,6 +83,11 @@ class SCIPEdge(BaseModel):
     kind: CPGEdgeKind
     line: int | None = None
     metadata: dict[str, str] = Field(default_factory=dict)
+    confidence: str = Field(
+        default="heuristic",
+        description="One of: confirmed, heuristic, ambiguous, contradicted",
+    )
+    evidence: str = ""
 
 
 class SCIPSymbolNode(BaseModel):
