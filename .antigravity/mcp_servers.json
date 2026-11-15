@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "code-multi-indexer": {
+      "command": "python3",
+      "args": ["-m", "mcp_server.code_index_server"],
+      "env": {
+        "PYTHONPATH": "src"
+      }
+    }
+  }
+}

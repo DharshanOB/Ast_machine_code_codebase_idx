@@ -1,0 +1,89 @@
+name: Antigravity 4-Layer PR Review (Gemini)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base git ref/SHA"
+        required: true
+        default: "HEAD~1"
+      head_ref:
+        description: "Head git ref/SHA"
+        required: true
+        default: "HEAD"
+      pr_number:
+        description: "Optional PR number to post comment on"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  compiler-aware-pr-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
+        if: ${{ vars.GCP_PROJECT_ID != '' && secrets.GCP_WIF_PROVIDER != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install clang-18 and Antigravity PR Bot
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang-18
+          python3 -m pip install --upgrade pip
+          pip install -e ".[gcp]"
+
+      - name: Run 4-Layer PR Analysis & Gemini Review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          BASE_REF="${{ github.event.pull_request.base.sha || github.event.inputs.base_ref }}"
+          HEAD_REF="${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}"
+          EXTRA_ARGS=""
+          if [ -n "${{ vars.GCP_PROJECT_ID }}" ]; then
+            EXTRA_ARGS="--vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }} --gemini-model ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen-high' }}"
+          fi
+          ag-pr-review \
+            --mode pr \
+            --repo . \
+            --base "$BASE_REF" \
+            --head "$HEAD_REF" \
+            --out-md pr_review_summary.md \
+            --out-comments pr_review_comments.json \
+            $EXTRA_ARGS
+          cat pr_review_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post PR Summary & Inline Review Comments
+        if: ${{ github.event.pull_request.number != '' || github.event.inputs.pr_number != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body-file pr_review_summary.md
+          python3 - <<'EOF'
+          import json, os, subprocess
+          comments = json.loads(open("pr_review_comments.json").read())
+          for c in comments[:15]:
+              subprocess.run([
+                  "gh", "api",
+                  f"repos/{os.environ['REPO']}/pulls/{os.environ['PR_NUMBER']}/comments",
+                  "-f", f"body={c['body']}",
+                  "-f", f"commit_id={os.environ.get('GITHUB_SHA', '')}",
+                  "-f", f"path={c['path']}",
+                  "-F", f"line={c['line']}",
+                  "-f", "side=RIGHT",
+              ], check=False)
+          EOF
