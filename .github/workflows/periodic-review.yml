@@ -41,6 +41,7 @@ jobs:
       - name: Run Full-Repository 4-Layer Audit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
         run: |
           MODEL="${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-4-hydrogen-high' }}"
           EXTRA_ARGS="--gemini-model $MODEL"

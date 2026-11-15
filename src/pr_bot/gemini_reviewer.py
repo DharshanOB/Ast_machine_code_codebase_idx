@@ -52,9 +52,19 @@ def generate_vertex_gemini_review(
     from google import genai
     from google.genai import types
 
-    resolved_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    resolved_key = (
+        api_key
+        or os.environ.get("VERTEX_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    )
+    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in {"1", "true", "yes"}
     if resolved_key:
-        client = genai.Client(api_key=resolved_key)
+        client = (
+            genai.Client(vertexai=True, api_key=resolved_key)
+            if use_vertex
+            else genai.Client(api_key=resolved_key)
+        )
     elif project:
         client = genai.Client(vertexai=True, project=project, location=location)
     else:
