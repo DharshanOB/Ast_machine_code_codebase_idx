@@ -26,6 +26,8 @@ permissions:
 jobs:
   compiler-aware-pr-review:
     runs-on: ubuntu-latest
+    env:
+      GCP_WIF_PROVIDER: ${{ secrets.GCP_WIF_PROVIDER }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,7 +35,7 @@ jobs:
           fetch-depth: 0
 
       - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
-        if: ${{ vars.GCP_PROJECT_ID != '' && secrets.GCP_WIF_PROVIDER != '' }}
+        if: ${{ vars.GCP_PROJECT_ID != '' && env.GCP_WIF_PROVIDER != '' }}
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
