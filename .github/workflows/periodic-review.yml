@@ -41,7 +41,7 @@ jobs:
       - name: Restore Previous Review Baseline
         uses: actions/cache@v4
         with:
-          path: .antigravity_baseline.json
+          path: .astraea_baseline.json
           key: periodic-baseline-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
             periodic-baseline-${{ github.ref_name }}-
@@ -56,11 +56,11 @@ jobs:
           if [ -n "${{ vars.GCP_PROJECT_ID }}" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }}"
           fi
-          ag-pr-review \
+          astraea-review \
             --mode repo \
             --repo . \
-            --baseline .antigravity_baseline.json \
-            --out-baseline .antigravity_baseline.json \
+            --baseline .astraea_baseline.json \
+            --out-baseline .astraea_baseline.json \
             --out-md repo_review_report.md \
             --out-comments repo_review_comments.json \
             $EXTRA_ARGS

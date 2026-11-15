@@ -58,7 +58,7 @@ jobs:
           if [ -n "${{ vars.GCP_PROJECT_ID }}" ]; then
             EXTRA_ARGS="--vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }} --gemini-model ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}"
           fi
-          ag-pr-review \
+          astraea-review \
             --mode pr \
             --repo . \
             --base "$BASE_REF" \

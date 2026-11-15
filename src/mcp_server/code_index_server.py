@@ -1,4 +1,4 @@
-"""Phase 4: Antigravity FastMCP server & multi-layer indexing pipeline."""
+"""Phase 4: Astraea FastMCP server & multi-layer indexing pipeline."""
 
 from __future__ import annotations
 
@@ -274,7 +274,7 @@ def trace_symbol_dataflow(symbol_id: str, max_hops: int = 2) -> list[dict[str, A
 
 
 def main() -> None:
-    """Run the Antigravity code-multi-indexer MCP server over stdio."""
+    """Run the Astraea code-multi-indexer MCP server over stdio."""
     mcp.run(transport="stdio")
 
 

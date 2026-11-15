@@ -1,4 +1,4 @@
-"""CLI entrypoint for the Antigravity 4-Layer PR & Periodic Repository Review Bot."""
+"""CLI entrypoint for Astraea, the 4-Layer PR & Periodic Repository Review Bot."""
 
 from __future__ import annotations
 

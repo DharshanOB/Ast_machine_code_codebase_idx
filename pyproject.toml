@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "antigravity-code-indexer"
+name = "astraea-code-indexer"
 version = "0.1.0"
 description = "Multi-layer AI code indexer unifying AST, SCIP/CPG, LLVM SSA IR, and disassembled machine code via DWARF alignment."
 readme = "research.md"
@@ -39,6 +39,8 @@ gcp = [
 ]
 
 [project.scripts]
+astraea-index = "mcp_server.code_index_server:main"
+astraea-review = "pr_bot.cli:main"
 ag-code-index = "mcp_server.code_index_server:main"
 ag-pr-review = "pr_bot.cli:main"
 
