@@ -56,7 +56,7 @@ jobs:
           HEAD_REF="${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}"
           EXTRA_ARGS=""
           if [ -n "${{ vars.GCP_PROJECT_ID }}" ]; then
-            EXTRA_ARGS="--vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }} --gemini-model ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen-high' }}"
+            EXTRA_ARGS="--vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }} --gemini-model ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}"
           fi
           ag-pr-review \
             --mode pr \
