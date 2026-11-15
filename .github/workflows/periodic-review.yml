@@ -38,7 +38,15 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install -e ".[gcp]"
 
-      - name: Run Full-Repository 4-Layer Audit
+      - name: Restore Previous Review Baseline
+        uses: actions/cache@v4
+        with:
+          path: .antigravity_baseline.json
+          key: periodic-baseline-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            periodic-baseline-${{ github.ref_name }}-
+
+      - name: Run Full-Repository Audit
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
@@ -51,6 +59,8 @@ jobs:
           ag-pr-review \
             --mode repo \
             --repo . \
+            --baseline .antigravity_baseline.json \
+            --out-baseline .antigravity_baseline.json \
             --out-md repo_review_report.md \
             --out-comments repo_review_comments.json \
             $EXTRA_ARGS

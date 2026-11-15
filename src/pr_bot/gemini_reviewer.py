@@ -6,14 +6,29 @@ import os
 
 from pr_bot.analyzer import PRReviewReport, RepoReviewReport
 
-_SYSTEM_INSTRUCTION = (
+_PR_SYSTEM_INSTRUCTION = (
     "You are a senior systems & security code reviewer. You are given deterministic "
     "4-layer analysis (AST complexity, SCIP/CPG blast radius, LLVM SSA IR similarity, "
-    "and disassembled machine-code basic blocks) alongside optional diff context. "
-    "Ground every claim in the provided evidence: highlight risks to downstream callers, "
-    "explain compiler-lowering regressions or confirm NFC refactors, and suggest concrete fixes. "
-    "Keep the review concise and actionable."
+    "and disassembled machine-code basic blocks) alongside git diff context. "
+    "Ground every claim in the provided evidence and source code: highlight risks to "
+    "downstream callers, explain compiler-lowering regressions or confirm NFC refactors, "
+    "and suggest concrete fixes. Never speculate about uninspected code."
 )
+
+_REPO_SYSTEM_INSTRUCTION = (
+    "You are a senior software & security code reviewer performing a periodic repository audit. "
+    "You are given deterministic AST complexity, cross-file call-graph blast radius, "
+    "semantic clone clusters, and the actual source code of the top hotspot functions. "
+    "Ground every finding strictly in the provided source code and metrics: identify concrete "
+    "bugs (missing idempotency, swallowed exceptions, N+1 queries, injection risks) with exact "
+    "file/line references. Do NOT speculate about code you have not seen."
+)
+
+
+def _uses_compiler_lowering(report: PRReviewReport | RepoReviewReport, diff_text: str) -> bool:
+    if diff_text.strip() or isinstance(report, PRReviewReport):
+        return True
+    return bool(getattr(report, "has_native_lowering", False))
 
 
 def build_review_prompt(
@@ -21,8 +36,20 @@ def build_review_prompt(
     diff_text: str = "",
     max_diff_chars: int = 12_000,
 ) -> str:
-    """Build a structured prompt combining 4-layer deterministic evidence and optional git diff."""
-    sections = [f"### 4-Layer Deterministic Report\n\n{report.to_markdown()}"]
+    """Build a structured prompt combining deterministic evidence, hotspot source, and diff."""
+    sections = [f"### Deterministic Analysis Report\n\n{report.to_markdown()}"]
+
+    hotspot_sources = getattr(report, "hotspot_sources", [])
+    if hotspot_sources:
+        src_blocks = ["### Top Hotspot Source Code"]
+        for hs in hotspot_sources[:5]:
+            src_blocks.append(
+                f"#### `{hs['symbol_name']}` (`{hs['file_path']}:{hs['line_start']}`, "
+                f"CC={hs['complexity']}, callers={hs['callers']})\n"
+                f"```\n{hs['source_text']}\n```"
+            )
+        sections.append("\n\n".join(src_blocks))
+
     if diff_text.strip():
         truncated_diff = (
             diff_text[:max_diff_chars] + "\n...[diff truncated]"
@@ -31,12 +58,20 @@ def build_review_prompt(
         )
         sections.append(f"### Unified Git Diff\n\n```diff\n{truncated_diff}\n```")
 
-    sections.append(
-        "Provide:\n"
-        "1. **Executive Risk Assessment** (based on blast radius, hotspots & lowering deltas)\n"
-        "2. **Correctness, Security & Performance Observations**\n"
-        "3. **Actionable Recommendations**\n"
-    )
+    if _uses_compiler_lowering(report, diff_text):
+        sections.append(
+            "Provide:\n"
+            "1. **Executive Risk Assessment** (blast radius, hotspots & lowering deltas/NFC)\n"
+            "2. **Correctness, Security & Performance Observations** (cite exact code lines)\n"
+            "3. **Actionable Recommendations**\n"
+        )
+    else:
+        sections.append(
+            "Provide:\n"
+            "1. **Executive Risk Assessment** (top blast-radius hotspots & run-to-run deltas)\n"
+            "2. **Concrete Code Review Findings** (cite exact lines from Top Hotspot Source Code)\n"
+            "3. **Prioritized Refactoring & Clone-Consolidation Plan**\n"
+        )
     return "\n\n".join(sections)
 
 
@@ -71,11 +106,16 @@ def generate_vertex_gemini_review(
         raise ValueError("Provide either GEMINI_API_KEY/GOOGLE_API_KEY or a GCP --vertex-project.")
 
     prompt = build_review_prompt(report, diff_text)
+    sys_inst = (
+        _PR_SYSTEM_INSTRUCTION
+        if _uses_compiler_lowering(report, diff_text)
+        else _REPO_SYSTEM_INSTRUCTION
+    )
     response = client.models.generate_content(
         model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_INSTRUCTION,
+            system_instruction=sys_inst,
             temperature=0.2,
         ),
     )

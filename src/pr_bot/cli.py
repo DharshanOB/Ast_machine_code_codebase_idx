@@ -39,6 +39,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--gemini-model", default="gemini-4-hydrogen", help="Gemini model name."
     )
+    parser.add_argument(
+        "--baseline",
+        default=None,
+        help="Optional prior baseline snapshot JSON for run-to-run diffing (--mode repo).",
+    )
+    parser.add_argument(
+        "--out-baseline",
+        default=None,
+        help="Optional output path to save current baseline snapshot JSON (--mode repo).",
+    )
     args = parser.parse_args(argv)
 
     report: PRReviewReport | RepoReviewReport
@@ -47,7 +57,12 @@ def main(argv: list[str] | None = None) -> int:
         report = analyze_repository(
             repo_path=args.repo,
             compile_commands_path=args.compile_commands,
+            baseline_path=args.baseline,
         )
+        if args.out_baseline:
+            Path(args.out_baseline).write_text(
+                json.dumps(report.snapshot(), indent=2), encoding="utf-8"
+            )
         inline_comments = []
     else:
         report = analyze_git_pr(

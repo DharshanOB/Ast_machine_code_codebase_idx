@@ -104,7 +104,7 @@ def test_pr_bot_lowering_regression_and_inline_comments(tmp_path: Path) -> None:
     assert comments[0]["side"] == "RIGHT"
 
     prompt = build_review_prompt(report, diff)
-    assert "4-Layer Deterministic Report" in prompt
+    assert "Deterministic Analysis Report" in prompt
     assert "LOWERING_REGRESSION" in prompt
     assert "Unified Git Diff" in prompt
 
@@ -120,10 +120,10 @@ def test_periodic_repository_audit(tmp_path: Path) -> None:
     )
     repo_report = analyze_repository(tmp_path, clone_threshold=0.92)
     assert repo_report.indexed_units == 2
-    assert len(repo_report.clone_pairs) >= 1
+    assert len(repo_report.clone_clusters) >= 1
     md = repo_report.to_markdown()
     assert "Periodic 4-Layer Repository Review" in md
-    assert "Semantic / IR Clone Pairs" in md
+    assert "Semantic / IR Clone Clusters" in md
 
 
 def test_python_bytecode_and_javascript_indexing(tmp_path: Path) -> None:

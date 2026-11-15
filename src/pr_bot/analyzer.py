@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import tempfile
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from indexer.models import ASTChunkNode, CPGEdgeKind, IRStatus, UnifiedCodeUnit
+from indexer.models import ASTChunkNode, CPGEdgeKind, IRStatus, Language, UnifiedCodeUnit
 from mcp_server.code_index_server import CodeIndexPipeline
 from storage.hybrid_store import compute_wl_ir_vector, cosine_similarity
 
@@ -157,20 +159,66 @@ class RepoReviewReport(BaseModel):
     repo_path: str
     indexed_units: int
     degraded_units: int
+    has_native_lowering: bool = False
+    degraded_details: list[dict[str, str]] = Field(default_factory=list)
     hotspots: list[dict[str, Any]] = Field(default_factory=list)
+    hotspot_sources: list[dict[str, Any]] = Field(default_factory=list)
     clone_pairs: list[dict[str, Any]] = Field(default_factory=list)
+    clone_clusters: list[dict[str, Any]] = Field(default_factory=list)
+    delta_summary: dict[str, Any] = Field(default_factory=dict)
     findings: list[ReviewFinding] = Field(default_factory=list)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a compact baseline snapshot for run-to-run diffing."""
+        return {
+            "degraded_units": self.degraded_units,
+            "hotspots": {
+                f"{h['file_path']}::{h['symbol_name']}": int(h["complexity"])
+                for h in self.hotspots
+            },
+        }
 
     def to_markdown(self) -> str:
         """Render a periodic repository health review in Markdown."""
+        title = (
+            "## Antigravity Periodic 4-Layer Repository Review"
+            if self.has_native_lowering
+            else "## Antigravity Periodic Repository Review"
+        )
         lines: list[str] = [
-            "## Antigravity Periodic 4-Layer Repository Review",
+            title,
             "",
             f"**Indexed Units:** {self.indexed_units} | "
             f"**Degraded Units:** {self.degraded_units} | "
             f"**Findings:** {len(self.findings)}",
             "",
         ]
+        if self.delta_summary:
+            new_h = self.delta_summary.get("new_hotspots", [])
+            worsened = self.delta_summary.get("worsened_hotspots", [])
+            resolved = self.delta_summary.get("resolved_hotspots", [])
+            lines.extend(["### Changes Since Last Run", ""])
+            lines.append(
+                f"- **New Hotspots:** {len(new_h)} | "
+                f"**Worsened:** {len(worsened)} | "
+                f"**Resolved:** {len(resolved)}"
+            )
+            for item in new_h[:10]:
+                lines.append(f"  - `[NEW]` `{item['key']}` (CC={item['complexity']})")
+            for item in worsened[:10]:
+                lines.append(
+                    f"  - `[WORSENED]` `{item['key']}` (CC {item['before']} -> {item['after']})"
+                )
+            lines.append("")
+
+        if self.degraded_details:
+            lines.extend(["### Degraded Units", ""])
+            for d in self.degraded_details[:20]:
+                lines.append(
+                    f"- `{d['file_path']}` (`{d['symbol_name']}`): {d['reason']}"
+                )
+            lines.append("")
+
         if self.hotspots:
             lines.extend(
                 [
@@ -187,7 +235,17 @@ class RepoReviewReport(BaseModel):
                 )
             lines.append("")
 
-        if self.clone_pairs:
+        if self.clone_clusters:
+            lines.extend(["### Semantic / IR Clone Clusters", ""])
+            for cl in self.clone_clusters:
+                members = ", ".join(f"`{m}`" for m in cl["members"])
+                lines.append(
+                    f"- **Cluster ({len(cl['members'])} members, "
+                    f"similarity={cl['min_similarity']:.3f}–{cl['max_similarity']:.3f}):** "
+                    f"{members}"
+                )
+            lines.append("")
+        elif self.clone_pairs:
             lines.extend(["### Semantic / IR Clone Pairs", ""])
             for c in self.clone_pairs:
                 lines.append(
@@ -464,18 +522,100 @@ def analyze_git_pr(
             )
 
 
+def _cluster_clones(clone_pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group pairwise clones into connected-component clusters."""
+    adj: dict[str, list[tuple[str, float]]] = {}
+    for pair in clone_pairs:
+        src = str(pair["source"])
+        dst = str(pair["target"])
+        sim = float(pair["similarity"])
+        adj.setdefault(src, []).append((dst, sim))
+        adj.setdefault(dst, []).append((src, sim))
+
+    visited: set[str] = set()
+    clusters: list[dict[str, Any]] = []
+    for node in sorted(adj):
+        if node in visited:
+            continue
+        comp: list[str] = []
+        sims: list[float] = []
+        queue: deque[str] = deque([node])
+        visited.add(node)
+        while queue:
+            curr = queue.popleft()
+            comp.append(curr)
+            for nxt, sim in adj.get(curr, []):
+                sims.append(sim)
+                if nxt not in visited:
+                    visited.add(nxt)
+                    queue.append(nxt)
+        if len(comp) >= 2:
+            clusters.append(
+                {
+                    "members": sorted(comp),
+                    "min_similarity": min(sims) if sims else 1.0,
+                    "max_similarity": max(sims) if sims else 1.0,
+                }
+            )
+    clusters.sort(key=lambda c: len(c["members"]), reverse=True)
+    return clusters
+
+
+def _compute_baseline_delta(
+    hotspots: list[dict[str, Any]],
+    baseline_path: str | Path | None,
+) -> dict[str, Any]:
+    """Compare current hotspots against a prior baseline snapshot JSON."""
+    if baseline_path is None:
+        return {}
+    path = Path(baseline_path)
+    if not path.exists():
+        return {}
+    try:
+        prev_data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    prev_hotspots: dict[str, int] = {
+        str(k): int(v) for k, v in (prev_data.get("hotspots") or {}).items()
+    }
+    curr_hotspots: dict[str, int] = {
+        f"{h['file_path']}::{h['symbol_name']}": int(h["complexity"]) for h in hotspots
+    }
+    new_h = [
+        {"key": k, "complexity": cc}
+        for k, cc in curr_hotspots.items()
+        if k not in prev_hotspots
+    ]
+    worsened = [
+        {"key": k, "before": prev_hotspots[k], "after": cc}
+        for k, cc in curr_hotspots.items()
+        if k in prev_hotspots and cc > prev_hotspots[k]
+    ]
+    resolved = [k for k in prev_hotspots if k not in curr_hotspots]
+    return {
+        "new_hotspots": new_h,
+        "worsened_hotspots": worsened,
+        "resolved_hotspots": resolved,
+    }
+
+
 def analyze_repository(
     repo_path: str | Path,
     compile_commands_path: str | Path | None = None,
-    complexity_threshold: int = 8,
+    complexity_threshold: int = 15,
     clone_threshold: float = 0.94,
+    baseline_path: str | Path | None = None,
 ) -> RepoReviewReport:
-    """Run a full-repository 4-layer audit for periodic or manual reviews."""
+    """Run a full-repository audit for periodic or manual reviews."""
     root = Path(repo_path).resolve()
     pipe = CodeIndexPipeline()
     summary = pipe.index_workspace(root, compile_commands_path=compile_commands_path)
 
+    has_native_lowering = False
+    degraded_details: list[dict[str, str]] = []
     hotspots: list[dict[str, Any]] = []
+    hotspot_candidates: list[dict[str, Any]] = []
     clone_pairs: list[dict[str, Any]] = []
     seen_pairs: set[tuple[str, str]] = set()
     findings: list[ReviewFinding] = []
@@ -485,6 +625,23 @@ def analyze_repository(
         rel = _rel_path(ast.file_path, root)
         sym_name = ast.symbol_name or "<anonymous>"
         is_container = ast.node_kind in _CONTAINER_NODE_TYPES
+
+        if (
+            ast.language in (Language.C, Language.CPP, Language.RUST)
+            and unit.ir_status == IRStatus.OK
+        ):
+            has_native_lowering = True
+
+        if unit.ir_status == IRStatus.DEGRADED:
+            reason = (
+                "Tree-sitter syntax error"
+                if ast.has_syntax_error
+                else "Compiler/bytecode lowering unavailable or failed"
+            )
+            degraded_details.append(
+                {"file_path": rel, "symbol_name": sym_name, "reason": reason}
+            )
+
         callers = 0
         if unit.scip_symbol is not None:
             slices = pipe.cpg.k_hop_slice(
@@ -496,6 +653,16 @@ def analyze_repository(
             callers = len({str(s["source"]) for s in slices})
 
         if not is_container and (ast.cyclomatic_complexity >= complexity_threshold or callers >= 3):
+            hotspot_candidates.append(
+                {
+                    "symbol_name": sym_name,
+                    "file_path": rel,
+                    "line_start": ast.line_start,
+                    "complexity": ast.cyclomatic_complexity,
+                    "callers": callers,
+                    "source_text": ast.source_text,
+                }
+            )
             hotspots.append(
                 {
                     "symbol_name": sym_name,
@@ -505,14 +672,22 @@ def analyze_repository(
                 }
             )
         if not is_container and ast.cyclomatic_complexity >= complexity_threshold:
+            severity = (
+                "HIGH"
+                if (ast.cyclomatic_complexity >= 25 or callers >= 10)
+                else "MEDIUM"
+            )
             findings.append(
                 ReviewFinding(
-                    severity="MEDIUM",
-                    category="COMPLEXITY_SPIKE",
+                    severity=severity,
+                    category="HIGH_COMPLEXITY",
                     file_path=rel,
                     line=ast.line_start,
                     symbol_name=sym_name,
-                    message=f"High cyclomatic complexity ({ast.cyclomatic_complexity}).",
+                    message=(
+                        f"Cyclomatic complexity {ast.cyclomatic_complexity} "
+                        f"with {callers} callers."
+                    ),
                 )
             )
         if ast.has_syntax_error:
@@ -527,20 +702,26 @@ def analyze_repository(
                 )
             )
 
-        if is_container:
+        line_span = ast.line_end - ast.line_start + 1
+        if is_container or line_span < 3 or len(ast.lexical_tokens) < 4:
             continue
         modality = "ir_structural" if unit.ir_status == IRStatus.OK else "ast_dense"
         for cid, score in pipe.store.find_clones(
-            unit.unit_id, modality=modality, threshold=clone_threshold, top_k=2
+            unit.unit_id, modality=modality, threshold=clone_threshold, top_k=5
         ):
             other = pipe.store.units.get(cid)
+            if other is None:
+                continue
+            other_ast = other.ast_chunk
+            other_span = other_ast.line_end - other_ast.line_start + 1
             if (
-                other is None
-                or other.ast_chunk.node_kind in _CONTAINER_NODE_TYPES
-                or _is_nested_chunk(ast, other.ast_chunk)
+                other_ast.node_kind in _CONTAINER_NODE_TYPES
+                or other_span < 3
+                or len(other_ast.lexical_tokens) < 4
+                or _is_nested_chunk(ast, other_ast)
             ):
                 continue
-            other_name = other.ast_chunk.symbol_name or "<anonymous>"
+            other_name = other_ast.symbol_name or "<anonymous>"
             if other_name == sym_name:
                 continue
             pair = (min(sym_name, other_name), max(sym_name, other_name))
@@ -549,23 +730,53 @@ def analyze_repository(
                 clone_pairs.append(
                     {"source": sym_name, "target": other_name, "similarity": score}
                 )
-                findings.append(
-                    ReviewFinding(
-                        severity="INFO",
-                        category="CLONE",
-                        file_path=rel,
-                        line=ast.line_start,
-                        symbol_name=sym_name,
-                        message=f"Semantic clone of `{other_name}` (similarity={score:.3f}).",
-                    )
-                )
+
+    clone_clusters = _cluster_clones(clone_pairs)
+    for cl in clone_clusters:
+        members_str = ", ".join(f"`{m}`" for m in cl["members"])
+        findings.append(
+            ReviewFinding(
+                severity="INFO",
+                category="CLONE_CLUSTER",
+                file_path="",
+                line=1,
+                symbol_name=cl["members"][0],
+                message=(
+                    f"{len(cl['members'])}-member semantic clone cluster "
+                    f"(similarity={cl['min_similarity']:.3f}–{cl['max_similarity']:.3f}): "
+                    f"{members_str}."
+                ),
+            )
+        )
 
     hotspots.sort(key=lambda h: (int(h["complexity"]), int(h["callers"])), reverse=True)
+    hotspot_candidates.sort(
+        key=lambda h: int(h["complexity"]) * max(1, int(h["callers"])),
+        reverse=True,
+    )
+    hotspot_sources = [
+        {
+            "symbol_name": h["symbol_name"],
+            "file_path": h["file_path"],
+            "line_start": h["line_start"],
+            "complexity": h["complexity"],
+            "callers": h["callers"],
+            "source_text": str(h["source_text"])[:4000],
+        }
+        for h in hotspot_candidates[:5]
+    ]
+    delta_summary = _compute_baseline_delta(hotspots, baseline_path)
+
     return RepoReviewReport(
         repo_path=str(root),
         indexed_units=int(summary.get("indexed_units", 0)),
         degraded_units=int(summary.get("degraded_units", 0)),
+        has_native_lowering=has_native_lowering,
+        degraded_details=degraded_details,
         hotspots=hotspots[:20],
+        hotspot_sources=hotspot_sources,
         clone_pairs=clone_pairs[:20],
+        clone_clusters=clone_clusters[:15],
+        delta_summary=delta_summary,
         findings=findings,
     )
