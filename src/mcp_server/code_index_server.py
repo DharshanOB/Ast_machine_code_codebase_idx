@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import tempfile
@@ -92,18 +93,23 @@ class CodeIndexPipeline:
         self.dwarf = DWARFAligner()
         self.store = HybridCodeStore(storage_dir=storage_dir)
         self.symbol_to_unit: dict[str, str] = {}
+        self._file_hashes: dict[str, str] = {}
+        self._file_chunks: dict[str, list[ASTChunkNode]] = {}
+        self._file_unit_ids: dict[str, list[str]] = {}
 
     def index_workspace(
-        self, repo_path: str | Path, compile_commands_path: str | Path | None = None
+        self,
+        repo_path: str | Path,
+        compile_commands_path: str | Path | None = None,
+        incremental: bool = True,
     ) -> dict[str, Any]:
-        """Index all supported source files in repo_path across AST, CPG, IR, and Binary layers."""
+        """Index repo_path across AST, CPG, IR, and Binary layers (incremental by default)."""
         root = Path(repo_path).resolve()
         if not root.exists() or not root.is_dir():
             return {"indexed_units": 0, "error": f"Directory does not exist: {repo_path}"}
 
         compile_flags_by_file = self._load_compile_commands(compile_commands_path)
-        all_chunks: list[ASTChunkNode] = []
-        file_chunks: dict[Path, list[ASTChunkNode]] = {}
+        current_files: dict[str, tuple[Path, str]] = {}
 
         for file_path in sorted(root.rglob("*")):
             if not file_path.is_file():
@@ -113,18 +119,41 @@ class CodeIndexPipeline:
                 continue
             if detect_language(file_path) is None:
                 continue
-            chunks = self.chunker.chunk_file(file_path)
-            if chunks:
-                all_chunks.extend(chunks)
-                file_chunks[file_path] = chunks
+            digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+            current_files[str(file_path)] = (file_path, digest)
 
+        deleted_paths = [p for p in self._file_hashes if p not in current_files]
+        stale_unit_ids: list[str] = []
+        for p in deleted_paths:
+            self._file_hashes.pop(p, None)
+            self._file_chunks.pop(p, None)
+            stale_unit_ids.extend(self._file_unit_ids.pop(p, []))
+
+        changed_files: dict[Path, list[ASTChunkNode]] = {}
+        skipped_unchanged = 0
+        for p_str, (file_path, digest) in current_files.items():
+            if incremental and self._file_hashes.get(p_str) == digest:
+                skipped_unchanged += 1
+                continue
+            stale_unit_ids.extend(self._file_unit_ids.pop(p_str, []))
+            chunks = self.chunker.chunk_file(file_path)
+            self._file_hashes[p_str] = digest
+            if chunks:
+                self._file_chunks[p_str] = chunks
+                changed_files[file_path] = chunks
+            else:
+                self._file_chunks.pop(p_str, None)
+
+        deleted_count = self.store.delete_units(stale_unit_ids)
+        all_chunks = [c for chunk_list in self._file_chunks.values() for c in chunk_list]
+        self.cpg = SemanticCPGBuilder()
         symbols = self.cpg.build_from_ast_chunks(all_chunks)
         chunk_to_symbol = {sym.chunk_id: sym for sym in symbols.values() if sym.chunk_id}
 
         units: list[UnifiedCodeUnit] = []
         degraded_count = 0
 
-        for src_path, chunks in file_chunks.items():
+        for src_path, chunks in changed_files.items():
             ir_by_fn: dict[str, LLVMIRGraph] = {}
             bin_by_fn: dict[str, list[BinaryBasicBlock]] = {}
             dwarf_maps: list[DWARFLineMapping] = []
@@ -211,6 +240,7 @@ class CodeIndexPipeline:
                     degraded_reason=reason,
                 )
                 units.append(unit)
+                self._file_unit_ids.setdefault(str(src_path), []).append(unit.unit_id)
                 if sym is not None:
                     self.symbol_to_unit[sym.symbol_uri] = unit.unit_id
                 if chunk.symbol_name:
@@ -219,6 +249,8 @@ class CodeIndexPipeline:
         count = self.store.upsert_units(units)
         return {
             "indexed_units": count,
+            "skipped_unchanged_files": skipped_unchanged,
+            "deleted_units": deleted_count,
             "degraded_units": degraded_count,
             "symbols_count": len(symbols),
         }
@@ -299,9 +331,13 @@ _PIPELINE = CodeIndexPipeline()
 
 
 @mcp.tool()
-def index_workspace(repo_path: str, compile_commands_path: str | None = None) -> dict[str, Any]:
+def index_workspace(
+    repo_path: str, compile_commands_path: str | None = None, incremental: bool = True
+) -> dict[str, Any]:
     """Index a repository across AST, SCIP/CPG, LLVM IR, and disassembled Machine Code."""
-    return _PIPELINE.index_workspace(repo_path, compile_commands_path)
+    return _PIPELINE.index_workspace(
+        repo_path, compile_commands_path, incremental=incremental
+    )
 
 
 @mcp.tool()

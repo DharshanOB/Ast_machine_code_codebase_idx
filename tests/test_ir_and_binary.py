@@ -200,3 +200,57 @@ def test_end_to_end_clang_ir_and_elf_lifting(tmp_path: Path) -> None:
     aligner = DWARFAligner()
     mappings = aligner.extract_mappings(obj_path, default_file=str(src))
     assert len(mappings) > 0
+
+
+@pytest.mark.skipif(resolve_clang_binary() is None, reason="clang-18/clang not installed in VM")
+def test_optimized_o2_and_stripped_binary_dwarf(tmp_path: Path) -> None:
+    """Verify -O2 inlining DWARF extraction and graceful handling of stripped binaries."""
+    import shutil
+    import subprocess
+
+    src = tmp_path / "inlined.c"
+    src.write_text(
+        "static inline int helper_add(int a, int b) { return a + b; }\n"
+        "int entry_fn(int x) { return helper_add(x, 7); }\n",
+        encoding="utf-8",
+    )
+    lifter = BinaryLifter()
+    o2_obj = lifter.compile_to_object(src, tmp_path / "inlined_o2.o", opt_level="-O2")
+    lifted = lifter.lift_elf(o2_obj)
+    assert "entry_fn" in lifted
+
+    aligner = DWARFAligner()
+    o2_mappings = aligner.extract_mappings(o2_obj, default_file=str(src))
+    assert len(o2_mappings) > 0
+
+    strip_bin = shutil.which("strip")
+    if strip_bin is not None:
+        stripped_obj = tmp_path / "stripped.o"
+        shutil.copy2(o2_obj, stripped_obj)
+        subprocess.run([strip_bin, "--strip-debug", str(stripped_obj)], check=True)
+        assert aligner.extract_mappings(stripped_obj, default_file=str(src)) == []
+        assert "entry_fn" in lifter.lift_elf(stripped_obj)
+
+
+@pytest.mark.skipif(resolve_clang_binary() is None, reason="clang-18/clang not installed in VM")
+def test_validate_cpg_edges_against_llvm_ir_calls(tmp_path: Path) -> None:
+    """Validate CPG CALLS edges against compiler-generated LLVM IR call instructions."""
+    from indexer.ast_chunker import ASTChunker
+    from indexer.semantic_cpg import SemanticCPGBuilder
+
+    src = tmp_path / "calls.c"
+    src.write_text(
+        "__attribute__((noinline)) int leaf(int x) { return x + 1; }\n"
+        "int caller(int y) { return leaf(y) * 2; }\n",
+        encoding="utf-8",
+    )
+    chunks = ASTChunker().chunk_file(src)
+    cpg = SemanticCPGBuilder()
+    cpg.build_from_ast_chunks(chunks)
+
+    ir_pass = LLVMIRPass()
+    ir_text = ir_pass.compile_to_ir(src, opt_level="-O0")
+    graphs = ir_pass.parse_ir_module(ir_text, source_file=str(src))
+
+    validation = cpg.validate_against_ir_calls(graphs)
+    assert ("caller", "leaf") in validation["confirmed"]

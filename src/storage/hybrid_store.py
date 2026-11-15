@@ -7,12 +7,14 @@ import json
 import math
 import sqlite3
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import networkx as nx
 import tantivy
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PointIdsList, PointStruct, VectorParams
 
 from indexer.ast_chunker import split_identifier_tokens
 from indexer.models import BinaryBasicBlock, LLVMIRGraph, UnifiedCodeUnit
@@ -148,6 +150,21 @@ class HybridCodeStore:
             else tantivy.Index(self._tantivy_schema)
         )
         self._ensure_qdrant_collection()
+        if self._db_path is not None:
+            self.recover_from_sqlite()
+
+    def close(self) -> None:
+        """Close underlying storage clients (releasing local Qdrant file locks)."""
+        self._qdrant.close()
+
+    @staticmethod
+    def _unit_point_id(unit_id: str) -> int:
+        """Derive a deterministic 63-bit Qdrant point ID from a unit_id."""
+        try:
+            return (int(unit_id[:16], 16) & ((1 << 63) - 1)) or 1
+        except ValueError:
+            digest = hashlib.sha256(unit_id.encode("utf-8")).digest()
+            return (int.from_bytes(digest[:8], "big") & ((1 << 63) - 1)) or 1
 
     def upsert_units(
         self, units: list[UnifiedCodeUnit], commit_sha: str = "working-tree"
@@ -158,15 +175,18 @@ class HybridCodeStore:
 
         writer = self._tantivy_index.writer()
         qdrant_points: list[PointStruct] = []
+        staged_units: dict[str, UnifiedCodeUnit] = {}
+        staged_vectors: dict[str, dict[str, list[float]]] = {}
 
         for unit in units:
-            self.units[unit.unit_id] = unit
+            staged_units[unit.unit_id] = unit
             ast = unit.ast_chunk
             ir_tokens = unit.ir_graph.canonical_tokens if unit.ir_graph else []
             asm_tokens = [
                 insn for bb in unit.binary_blocks for insn in bb.normalized_instructions
             ]
 
+            writer.delete_documents_by_term("unit_id", unit.unit_id)
             writer.add_document(
                 tantivy.Document(
                     unit_id=unit.unit_id,
@@ -184,13 +204,14 @@ class HybridCodeStore:
             )
             ir_vec = compute_wl_ir_vector(unit.ir_graph)
             bin_vec = compute_binary_cfg_vector(unit.binary_blocks)
-            self.unit_vectors[unit.unit_id] = {
+            staged_vectors[unit.unit_id] = {
                 "ast_dense": ast_vec,
                 "ir_structural": ir_vec,
                 "bin_cfg": bin_vec,
             }
 
-            pid = self._point_ids.setdefault(unit.unit_id, len(self._point_ids) + 1)
+            pid = self._unit_point_id(unit.unit_id)
+            self._point_ids[unit.unit_id] = pid
             qdrant_points.append(
                 PointStruct(
                     id=pid,
@@ -207,8 +228,19 @@ class HybridCodeStore:
                 )
             )
 
+        if self._db_path is not None:
+            self._save_snapshot(commit_sha, units)
+
+        writer.commit()
+        self._tantivy_index.reload()
+        self._qdrant.upsert(collection_name=self.COLLECTION_NAME, points=qdrant_points)
+
+        for uid, unit in staged_units.items():
+            self.units[uid] = unit
+            self.unit_vectors[uid] = staged_vectors[uid]
+            ast = unit.ast_chunk
             self.graph.add_node(
-                unit.unit_id,
+                uid,
                 symbol_name=ast.symbol_name,
                 file_path=ast.file_path,
                 commit_sha=commit_sha,
@@ -221,13 +253,119 @@ class HybridCodeStore:
                         kind=edge.kind.value,
                         line=edge.line,
                     )
+        return len(units)
 
+    def delete_units(self, unit_ids: list[str]) -> int:
+        """Delete stale/removed units across Tantivy, Qdrant, SQLite, and in-memory state."""
+        if not unit_ids:
+            return 0
+        writer = self._tantivy_index.writer()
+        point_ids: list[int | str | UUID] = []
+        removed = 0
+        for uid in unit_ids:
+            writer.delete_documents_by_term("unit_id", uid)
+            point_ids.append(self._point_ids.pop(uid, self._unit_point_id(uid)))
+            if uid in self.units:
+                self.units.pop(uid, None)
+                self.unit_vectors.pop(uid, None)
+                if uid in self.graph:
+                    self.graph.remove_node(uid)
+                removed += 1
+        writer.commit()
+        self._tantivy_index.reload()
+        if point_ids:
+            self._qdrant.delete(
+                collection_name=self.COLLECTION_NAME,
+                points_selector=PointIdsList(points=point_ids),
+            )
+        if self._db_path is not None:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.executemany("DELETE FROM units WHERE unit_id = ?", [(u,) for u in unit_ids])
+        return removed
+
+    def recover_from_sqlite(self) -> int:
+        """Reload units from SQLite and reconcile Tantivy and Qdrant indexes."""
+        if self._db_path is None or not self._db_path.exists():
+            return 0
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute("SELECT unit_json FROM units").fetchall()
+        if not rows:
+            return 0
+        recovered = [UnifiedCodeUnit.model_validate_json(r[0]) for r in rows]
+        writer = self._tantivy_index.writer()
+        qdrant_points: list[PointStruct] = []
+        for unit in recovered:
+            self.units[unit.unit_id] = unit
+            ast = unit.ast_chunk
+            ir_tokens = unit.ir_graph.canonical_tokens if unit.ir_graph else []
+            asm_tokens = [
+                insn for bb in unit.binary_blocks for insn in bb.normalized_instructions
+            ]
+            writer.delete_documents_by_term("unit_id", unit.unit_id)
+            writer.add_document(
+                tantivy.Document(
+                    unit_id=unit.unit_id,
+                    symbol_name=ast.symbol_name or "anonymous",
+                    file_path=ast.file_path,
+                    source_tokens=" ".join(ast.lexical_tokens),
+                    ir_tokens=" ".join(ir_tokens),
+                    asm_tokens=" ".join(asm_tokens),
+                )
+            )
+            ast_vec = _hash_feature_vector(
+                [*ast.lexical_tokens, *split_identifier_tokens(ast.scope_header)],
+                VECTOR_DIM_AST,
+            )
+            ir_vec = compute_wl_ir_vector(unit.ir_graph)
+            bin_vec = compute_binary_cfg_vector(unit.binary_blocks)
+            self.unit_vectors[unit.unit_id] = {
+                "ast_dense": ast_vec,
+                "ir_structural": ir_vec,
+                "bin_cfg": bin_vec,
+            }
+            pid = self._unit_point_id(unit.unit_id)
+            self._point_ids[unit.unit_id] = pid
+            qdrant_points.append(
+                PointStruct(
+                    id=pid,
+                    vector={
+                        "ast_dense": ast_vec,
+                        "ir_structural": ir_vec,
+                        "bin_cfg": bin_vec,
+                    },
+                    payload={
+                        "unit_id": unit.unit_id,
+                        "symbol_name": ast.symbol_name,
+                        "file_path": ast.file_path,
+                    },
+                )
+            )
         writer.commit()
         self._tantivy_index.reload()
         self._qdrant.upsert(collection_name=self.COLLECTION_NAME, points=qdrant_points)
-        if self._db_path is not None:
-            self._save_snapshot(commit_sha, units)
-        return len(units)
+        return len(recovered)
+
+    def verify_consistency(self) -> dict[str, Any]:
+        """Check document/point/row counts across in-memory, Tantivy, Qdrant, and SQLite."""
+        tantivy_count = self._tantivy_index.searcher().num_docs
+        qdrant_info = self._qdrant.get_collection(self.COLLECTION_NAME)
+        qdrant_count = int(qdrant_info.points_count or 0)
+        sqlite_count = len(self.units)
+        if self._db_path is not None and self._db_path.exists():
+            with sqlite3.connect(self._db_path) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM units").fetchone()
+                sqlite_count = int(row[0]) if row else 0
+        mem_count = len(self.units)
+        consistent = (
+            mem_count == tantivy_count == qdrant_count == sqlite_count
+        )
+        return {
+            "consistent": consistent,
+            "memory": mem_count,
+            "tantivy": tantivy_count,
+            "qdrant": qdrant_count,
+            "sqlite": sqlite_count,
+        }
 
     def rrf_search(
         self,
@@ -365,7 +503,7 @@ class HybridCodeStore:
     @staticmethod
     def _build_tantivy_schema() -> tantivy.Schema:
         builder = tantivy.SchemaBuilder()
-        builder.add_text_field("unit_id", stored=True)
+        builder.add_text_field("unit_id", stored=True, tokenizer_name="raw")
         builder.add_text_field("symbol_name", stored=True)
         builder.add_text_field("file_path", stored=True)
         builder.add_text_field("source_tokens", stored=False)
@@ -396,15 +534,27 @@ class HybridCodeStore:
                 )
                 """
             )
-            conn.commit()
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS units (
+                    unit_id TEXT PRIMARY KEY,
+                    commit_sha TEXT NOT NULL,
+                    unit_json TEXT NOT NULL
+                )
+                """
+            )
 
     def _save_snapshot(self, commit_sha: str, units: list[UnifiedCodeUnit]) -> None:
         if self._db_path is None:
             return
         payload = json.dumps([u.model_dump(mode="json") for u in units])
+        unit_rows = [(u.unit_id, commit_sha, u.model_dump_json()) for u in units]
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO snapshots (commit_sha, payload_json) VALUES (?, ?)",
                 (commit_sha, payload),
             )
-            conn.commit()
+            conn.executemany(
+                "INSERT OR REPLACE INTO units (unit_id, commit_sha, unit_json) VALUES (?, ?, ?)",
+                unit_rows,
+            )

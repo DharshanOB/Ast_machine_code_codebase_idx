@@ -411,8 +411,18 @@ def analyze_pr_directories(
             v_base = compute_wl_ir_vector(base_unit.ir_graph)
             v_head = compute_wl_ir_vector(head_unit.ir_graph)
             ir_sim = round(cosine_similarity(v_base, v_head), 4)
-            if ir_sim >= 0.99 and (
-                base_unit.ir_graph.canonical_tokens == head_unit.ir_graph.canonical_tokens
+            base_edges = sorted((e.flow_type, e.position) for e in base_unit.ir_graph.edges)
+            head_edges = sorted((e.flow_type, e.position) for e in head_unit.ir_graph.edges)
+            bin_match = True
+            if base_unit.binary_blocks and head_unit.binary_blocks:
+                bin_match = [b.normalized_instructions for b in base_unit.binary_blocks] == [
+                    b.normalized_instructions for b in head_unit.binary_blocks
+                ]
+            if (
+                ir_sim >= 0.99
+                and base_unit.ir_graph.canonical_tokens == head_unit.ir_graph.canonical_tokens
+                and base_edges == head_edges
+                and bin_match
             ):
                 nfc_verified = True
 

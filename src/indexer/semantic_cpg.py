@@ -17,7 +17,14 @@ import tree_sitter_rust
 from tree_sitter import Language as TSLanguage
 from tree_sitter import Node, Parser
 
-from indexer.models import ASTChunkNode, CPGEdgeKind, Language, SCIPEdge, SCIPSymbolNode
+from indexer.models import (
+    ASTChunkNode,
+    CPGEdgeKind,
+    Language,
+    LLVMIRGraph,
+    SCIPEdge,
+    SCIPSymbolNode,
+)
 
 _CALL_NODE_TYPES: frozenset[str] = frozenset(
     {"call_expression", "call", "macro_invocation", "new_expression"}
@@ -383,3 +390,32 @@ class SemanticCPGBuilder:
                     )
             for var in assigned_vars:
                 last_def_node[var] = line_node_id
+
+    def validate_against_ir_calls(
+        self, ir_graphs: list[LLVMIRGraph]
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Validate CPG CALLS edges against compiler-generated LLVM IR call instructions."""
+        ir_call_re = re.compile(r"\bcall\b[^@]*@([A-Za-z0-9_$.]+)\s*\(")
+        ir_calls: set[tuple[str, str]] = set()
+        for graph in ir_graphs:
+            caller = graph.function_name
+            for node in graph.nodes:
+                if node.opcode == "call":
+                    for match in ir_call_re.finditer(node.text):
+                        callee = match.group(1).split(".")[0]
+                        if callee and not callee.startswith("llvm"):
+                            ir_calls.add((caller, callee))
+
+        cpg_calls: set[tuple[str, str]] = set()
+        for src_uri, dst_uri, data in self.graph.edges(data=True):
+            if data.get("kind") == CPGEdgeKind.CALLS.value:
+                src_sym = self.symbols.get(src_uri)
+                dst_sym = self.symbols.get(dst_uri)
+                if src_sym and dst_sym:
+                    cpg_calls.add((src_sym.display_name, dst_sym.display_name))
+
+        return {
+            "confirmed": sorted(cpg_calls & ir_calls),
+            "cpg_only": sorted(cpg_calls - ir_calls),
+            "ir_only": sorted(ir_calls - cpg_calls),
+        }
