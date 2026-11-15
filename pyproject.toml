@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "antigravity-code-indexer"
+version = "0.1.0"
+description = "Multi-layer AI code indexer unifying AST, SCIP/CPG, LLVM SSA IR, and disassembled machine code via DWARF alignment."
+readme = "research.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.9.0",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-c>=0.23.0",
+    "tree-sitter-cpp>=0.23.0",
+    "tree-sitter-rust>=0.23.0",
+    "tree-sitter-python>=0.23.0",
+    "networkx>=3.3",
+    "capstone>=5.0.1",
+    "lief>=0.15.0",
+    "pyelftools>=0.31",
+    "llvmlite>=0.43.0",
+    "qdrant-client>=1.11.0",
+    "tantivy>=0.22.0",
+    "mcp>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "hypothesis>=6.100.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    "types-networkx>=3.3",
+]
+gcp = [
+    "google-genai>=1.0.0",
+]
+
+[project.scripts]
+ag-code-index = "mcp_server.code_index_server:main"
+ag-pr-review = "pr_bot.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/indexer", "src/storage", "src/mcp_server", "src/pr_bot"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["indexer", "storage", "mcp_server", "pr_bot"]
+
+[[tool.mypy.overrides]]
+module = ["elftools.*", "llvmlite.*", "capstone.*", "google.*"]
+ignore_missing_imports = true
