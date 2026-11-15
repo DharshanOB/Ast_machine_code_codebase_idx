@@ -1,4 +1,4 @@
-name: Antigravity Periodic & Manual Repository Review
+name: Astraea Periodic & Manual Repository Review
 
 on:
   schedule:
@@ -32,7 +32,7 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Install clang-18 and Antigravity Reviewer
+      - name: Install clang-18 and Astraea Reviewer
         run: |
           sudo apt-get update && sudo apt-get install -y clang-18
           python3 -m pip install --upgrade pip

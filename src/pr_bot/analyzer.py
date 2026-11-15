@@ -132,7 +132,7 @@ class PRReviewReport(BaseModel):
     def to_markdown(self) -> str:
         """Render a rich GitHub PR summary comment with compiler & CPG evidence."""
         lines: list[str] = [
-            "## Antigravity 4-Layer PR Review (AST -> CPG -> LLVM IR -> Machine Code)",
+            "## Astraea 4-Layer PR Review (AST -> CPG -> LLVM IR -> Machine Code)",
             "",
             f"**Base:** `{self.base_ref}` | **Head:** `{self.head_ref}` | "
             f"**Modified Functions:** {len(self.changed_functions)} | "
@@ -232,9 +232,9 @@ class RepoReviewReport(BaseModel):
     def to_markdown(self) -> str:
         """Render a periodic repository health review in Markdown."""
         title = (
-            "## Antigravity Periodic 4-Layer Repository Review"
+            "## Astraea Periodic 4-Layer Repository Review"
             if self.has_native_lowering
-            else "## Antigravity Periodic Repository Review"
+            else "## Astraea Periodic Repository Review"
         )
         lines: list[str] = [
             title,
