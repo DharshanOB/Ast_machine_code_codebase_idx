@@ -37,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--vertex-location", default="global", help="Vertex AI region/endpoint.")
     parser.add_argument(
-        "--gemini-model", default="gemini-4-hydrogen-high", help="Gemini model name."
+        "--gemini-model", default="gemini-4-hydrogen", help="Gemini model name."
     )
     args = parser.parse_args(argv)
 

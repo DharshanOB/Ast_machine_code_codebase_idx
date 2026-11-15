@@ -9,7 +9,7 @@ on:
       gemini_model:
         description: "Gemini model to use"
         required: false
-        default: "gemini-4-hydrogen-high"
+        default: "gemini-4-hydrogen"
 
 permissions:
   contents: read
@@ -43,7 +43,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
         run: |
-          MODEL="${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-4-hydrogen-high' }}"
+          MODEL="${{ github.event.inputs.gemini_model || vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}"
           EXTRA_ARGS="--gemini-model $MODEL"
           if [ -n "${{ vars.GCP_PROJECT_ID }}" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }}"

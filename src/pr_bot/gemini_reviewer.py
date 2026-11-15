@@ -45,7 +45,7 @@ def generate_vertex_gemini_review(
     diff_text: str = "",
     project: str | None = None,
     location: str = "global",
-    model: str = "gemini-4-hydrogen-high",
+    model: str = "gemini-4-hydrogen",
     api_key: str | None = None,
 ) -> str:
     """Call Gemini via API key (GEMINI_API_KEY/GOOGLE_API_KEY) or Google Cloud Vertex AI."""
