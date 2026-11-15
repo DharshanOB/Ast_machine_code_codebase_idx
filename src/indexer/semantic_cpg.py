@@ -42,7 +42,21 @@ _COMMENT_OR_STRING_TYPES: frozenset[str] = frozenset(
         "template_string",
     }
 )
-_ASSIGN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\n]+)?=(?!=)")
+_ASSIGN_RE = re.compile(
+    r"^\s*(?:[A-Za-z_][A-Za-z0-9_:*&<>]*\s+)*([A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"(?::\s*[A-Za-z0-9_\[\]., |]+)?\s*(?:([+\-*/%&|^]|<<|>>))?=(?!=)"
+)
+_CONTAINER_CHUNK_KINDS: frozenset[str] = frozenset(
+    {
+        "class_definition",
+        "class_declaration",
+        "class_specifier",
+        "struct_specifier",
+        "impl_item",
+        "trait_item",
+        "enum_specifier",
+    }
+)
 _MAX_CFG_LINES_PER_CHUNK = 500
 _INHERIT_RE = re.compile(
     r"(?:class|struct)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\(([^)]+)\)|:\s*(?:public|private|protected)?\s*([A-Za-z_][A-Za-z0-9_:]*))"
@@ -162,9 +176,13 @@ class SemanticCPGBuilder:
             chunk_uris.append((chunk, uri))
 
         for chunk, src_uri in chunk_uris:
-            self._link_calls(chunk, src_uri, name_to_uris)
             self._link_inheritance(chunk, src_uri, name_to_uris)
-            self._link_intraprocedural_def_use(chunk, src_uri)
+            if chunk.node_kind not in _CONTAINER_CHUNK_KINDS:
+                calls, sanitized_source = self._extract_calls_and_sanitized_source(chunk)
+                self._link_calls(chunk, src_uri, name_to_uris, calls=calls)
+                self._link_intraprocedural_def_use(
+                    chunk, src_uri, sanitized_source=sanitized_source
+                )
 
         return self.symbols
 
@@ -179,10 +197,11 @@ class SemanticCPGBuilder:
         if start_uri not in self.graph:
             return []
 
-        visited_states: set[tuple[str, int]] = {(start_uri, 0)}
-        seen_nodes: set[str] = {start_uri}
+        node_min_hop: dict[str, int] = {start_uri: 0}
+        emitted_edges: set[tuple[str, str, str, int | None]] = set()
         queue: deque[tuple[str, int]] = deque([(start_uri, 0)])
         results: list[dict[str, Any]] = []
+        allowed_kinds = {k.value for k in edge_kinds} if edge_kinds is not None else None
 
         while queue:
             curr_id, depth = queue.popleft()
@@ -197,27 +216,32 @@ class SemanticCPGBuilder:
                 for src, _, data in self.graph.in_edges(curr_id, data=True):
                     neighbors.append((src, "in", data))
 
+            next_depth = depth + 1
             for nxt_id, edge_dir, data in neighbors:
                 kind_str = str(data.get("kind", ""))
-                if edge_kinds is not None and kind_str not in {k.value for k in edge_kinds}:
+                if allowed_kinds is not None and kind_str not in allowed_kinds:
                     continue
-                next_depth = depth + 1
-                state = (nxt_id, next_depth)
-                if state in visited_states:
+                if nxt_id == curr_id and depth > 0:
                     continue
-                visited_states.add(state)
+                src_edge = curr_id if edge_dir == "out" else nxt_id
+                dst_edge = nxt_id if edge_dir == "out" else curr_id
+                line_val = data.get("line")
+                edge_key = (src_edge, dst_edge, kind_str, line_val)
+                if edge_key in emitted_edges:
+                    continue
+                emitted_edges.add(edge_key)
                 results.append(
                     {
-                        "source": curr_id if edge_dir == "out" else nxt_id,
-                        "target": nxt_id if edge_dir == "out" else curr_id,
+                        "source": src_edge,
+                        "target": dst_edge,
                         "kind": kind_str,
                         "hop": next_depth,
-                        "line": data.get("line"),
+                        "line": line_val,
                     }
                 )
-                if nxt_id not in seen_nodes:
-                    seen_nodes.add(nxt_id)
-                queue.append(state)
+                if nxt_id not in node_min_hop:
+                    node_min_hop[nxt_id] = next_depth
+                    queue.append((nxt_id, next_depth))
 
         return results
 
@@ -263,12 +287,15 @@ class SemanticCPGBuilder:
                 )
             )
 
-    def _extract_calls_ast(self, chunk: ASTChunkNode) -> list[tuple[str, str, int]]:
-        """Extract (callee_name, qualifier, 1-based line) from AST call nodes."""
+    def _extract_calls_and_sanitized_source(
+        self, chunk: ASTChunkNode
+    ) -> tuple[list[tuple[str, str, int]], str]:
+        """Parse chunk once to extract AST call sites and mask comments/strings."""
         parser = self._parsers.get(chunk.language)
         if parser is None:
-            return []
+            return [], chunk.source_text
         source_bytes = chunk.source_text.encode("utf-8")
+        masked_bytes = bytearray(source_bytes)
         tree = parser.parse(source_bytes)
         calls: list[tuple[str, str, int]] = []
 
@@ -334,49 +361,62 @@ class SemanticCPGBuilder:
 
         def _walk(node: Node) -> None:
             if node.type in _COMMENT_OR_STRING_TYPES:
+                for i in range(node.start_byte, min(node.end_byte, len(masked_bytes))):
+                    if masked_bytes[i] != ord("\n"):
+                        masked_bytes[i] = ord(" ")
                 return
             if node.type in _CALL_NODE_TYPES:
                 name, qualifier = _callee_identifier(node)
-                if name and name not in _KEYWORDS and name != chunk.symbol_name:
+                if name and name not in _KEYWORDS and (
+                    name != chunk.symbol_name or bool(qualifier)
+                ):
                     line_no = chunk.line_start + node.start_point[0]
                     calls.append((name, qualifier, line_no))
             for child in node.children:
                 _walk(child)
 
         _walk(tree.root_node)
+        return calls, bytes(masked_bytes).decode("utf-8", errors="replace")
+
+    def _extract_calls_ast(self, chunk: ASTChunkNode) -> list[tuple[str, str, int]]:
+        """Extract (callee_name, qualifier, 1-based line) from AST call nodes."""
+        calls, _ = self._extract_calls_and_sanitized_source(chunk)
         return calls
 
     def _strip_comments_and_strings(self, chunk: ASTChunkNode) -> str:
         """Blank out comment and string spans using Tree-sitter so def-use ignores them."""
-        parser = self._parsers.get(chunk.language)
-        if parser is None:
-            return chunk.source_text
-        source_bytes = bytearray(chunk.source_text.encode("utf-8"))
-        tree = parser.parse(bytes(source_bytes))
-
-        def _mask(node: Node) -> None:
-            if node.type in _COMMENT_OR_STRING_TYPES:
-                for i in range(node.start_byte, min(node.end_byte, len(source_bytes))):
-                    if source_bytes[i] != ord("\n"):
-                        source_bytes[i] = ord(" ")
-                return
-            for child in node.children:
-                _mask(child)
-
-        _mask(tree.root_node)
-        return bytes(source_bytes).decode("utf-8", errors="replace")
+        _, sanitized = self._extract_calls_and_sanitized_source(chunk)
+        return sanitized
 
     def _link_calls(
-        self, chunk: ASTChunkNode, src_uri: str, name_to_uris: dict[str, list[str]]
+        self,
+        chunk: ASTChunkNode,
+        src_uri: str,
+        name_to_uris: dict[str, list[str]],
+        calls: list[tuple[str, str, int]] | None = None,
     ) -> None:
         compat_langs = _COMPATIBLE_LANGUAGES.get(chunk.language, frozenset({chunk.language}))
-        for callee_name, qualifier, line_no in self._extract_calls_ast(chunk):
+        call_list = calls if calls is not None else self._extract_calls_ast(chunk)
+        for callee_name, qualifier, line_no in call_list:
             candidates = [
                 u
                 for u in name_to_uris.get(callee_name, [])
                 if u != src_uri
                 and (u not in self._uri_languages or self._uri_languages[u] in compat_langs)
             ]
+            if callee_name == chunk.symbol_name and (
+                not qualifier or qualifier in ("self", "this")
+            ):
+                if not candidates:
+                    self._add_edge(
+                        src_uri,
+                        src_uri,
+                        CPGEdgeKind.CALLS,
+                        line=line_no,
+                        confidence="heuristic",
+                        evidence="ast_call_self_recursive",
+                    )
+                continue
             if not candidates:
                 continue
             targets: list[str] = []
@@ -434,11 +474,20 @@ class SemanticCPGBuilder:
                         src_uri, target_uri, CPGEdgeKind.IMPLEMENTS, line=chunk.line_start
                     )
 
-    def _link_intraprocedural_def_use(self, chunk: ASTChunkNode, src_uri: str) -> None:
+    def _link_intraprocedural_def_use(
+        self,
+        chunk: ASTChunkNode,
+        src_uri: str,
+        sanitized_source: str | None = None,
+    ) -> None:
         last_def_node: dict[str, str] = {}
         prev_line_node: str | None = None
-        sanitized_source = self._strip_comments_and_strings(chunk)
-        lines = sanitized_source.splitlines()[:_MAX_CFG_LINES_PER_CHUNK]
+        clean_src = (
+            sanitized_source
+            if sanitized_source is not None
+            else self._strip_comments_and_strings(chunk)
+        )
+        lines = clean_src.splitlines()[:_MAX_CFG_LINES_PER_CHUNK]
         for offset, line_text in enumerate(lines):
             stripped = line_text.strip()
             if not stripped:
@@ -450,8 +499,18 @@ class SemanticCPGBuilder:
                 self._add_edge(prev_line_node, line_node_id, CPGEdgeKind.CFG_NEXT, line=line_no)
             prev_line_node = line_node_id
 
-            assigned_vars = {m.group(1) for m in _ASSIGN_RE.finditer(stripped)}
-            used_vars = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", stripped)) - assigned_vars
+            assign_m = _ASSIGN_RE.match(stripped)
+            if assign_m is not None:
+                lhs_var = assign_m.group(1)
+                compound_op = assign_m.group(2)
+                assigned_vars = {lhs_var}
+                rhs_text = stripped[assign_m.end() :]
+                used_vars = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", rhs_text))
+                if compound_op:
+                    used_vars.add(lhs_var)
+            else:
+                assigned_vars = set()
+                used_vars = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", stripped))
             for var in used_vars:
                 if var in last_def_node and last_def_node[var] != line_node_id:
                     self._add_edge(
@@ -468,26 +527,22 @@ class SemanticCPGBuilder:
         self, ir_graphs: list[LLVMIRGraph]
     ) -> dict[str, list[tuple[str, str]]]:
         """Validate CPG CALLS edges against compiler-generated LLVM IR call instructions."""
-        ir_call_re = re.compile(r"\bcall\b[^@]*@([A-Za-z0-9_$.]+)\s*\(")
+        ir_call_re = re.compile(r'\bcall\b[^@]*@(?:"([^"]+)"|([A-Za-z0-9_.$-]+))\s*\(')
         ir_calls: set[tuple[str, str]] = set()
         for graph in ir_graphs:
-            caller_candidates = {graph.function_name}
-            if graph.source_name:
-                caller_candidates.add(graph.source_name)
-            leaf_caller = extract_leaf_symbol_name(graph.function_name)
-            if leaf_caller:
-                caller_candidates.add(leaf_caller)
+            caller_norm = (
+                extract_leaf_symbol_name(graph.source_name or graph.function_name)
+                or graph.source_name
+                or graph.function_name
+            )
             for node in graph.nodes:
                 if node.opcode == "call":
                     for match in ir_call_re.finditer(node.text):
-                        raw_callee = match.group(1)
+                        raw_callee = match.group(1) or match.group(2) or ""
                         callee = raw_callee.split(".")[0]
                         if callee and not callee.startswith("llvm"):
-                            callee_leaf = extract_leaf_symbol_name(raw_callee)
-                            for c_caller in caller_candidates:
-                                ir_calls.add((c_caller, callee))
-                                if callee_leaf:
-                                    ir_calls.add((c_caller, callee_leaf))
+                            callee_norm = extract_leaf_symbol_name(raw_callee) or callee
+                            ir_calls.add((caller_norm, callee_norm))
 
         cpg_calls: set[tuple[str, str]] = set()
         ambiguous_calls: set[tuple[str, str]] = set()
@@ -498,15 +553,15 @@ class SemanticCPGBuilder:
                 if src_sym and dst_sym:
                     pair = (src_sym.display_name, dst_sym.display_name)
                     cpg_calls.add(pair)
-                    if pair in ir_calls:
+                    if data.get("confidence") == "ambiguous":
+                        ambiguous_calls.add(pair)
+                    elif pair in ir_calls:
                         data["confidence"] = "confirmed"
                         data["evidence"] = "llvm_ir_call"
-                    elif data.get("confidence") == "ambiguous":
-                        ambiguous_calls.add(pair)
 
         for sym in self.symbols.values():
             for edge in sym.edges:
-                if edge.kind == CPGEdgeKind.CALLS:
+                if edge.kind == CPGEdgeKind.CALLS and edge.confidence != "ambiguous":
                     dst_sym = self.symbols.get(edge.target_id)
                     if dst_sym and (sym.display_name, dst_sym.display_name) in ir_calls:
                         edge.confidence = "confirmed"

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from indexer.ast_chunker import ASTChunker, split_identifier_tokens
-from indexer.models import CPGEdgeKind, Language, compute_content_sha256
+from indexer.models import CPGEdgeKind, Language, LLVMIRGraph, ProGraMLNode, compute_content_sha256
 from indexer.semantic_cpg import SemanticCPGBuilder, make_symbol_uri
 
 
@@ -156,3 +156,153 @@ def test_k_hop_slice_handles_cycles() -> None:
     )
     sliced = builder.k_hop_slice(u1, max_hops=4, direction="forward")
     assert len(sliced) >= 2
+
+
+def test_decorated_python_docstring_rust_impl_type_and_cpp_operators() -> None:
+    """Decorated Python functions retain docstrings; Rust impl and C++ operators extract leaves."""
+    chunker = ASTChunker()
+
+    py_src = (
+        "class Service:\n"
+        "    @staticmethod\n"
+        "    def run(x: int) -> int:\n"
+        '        """Execute service task."""\n'
+        "        return x + 1\n"
+    )
+    py_chunks = chunker.chunk_source(py_src, Language.PYTHON, file_path="svc.py")
+    run_chunk = next(c for c in py_chunks if c.symbol_name == "run")
+    assert "Execute service task." in run_chunk.docstring
+
+    rs_src = (
+        "pub struct Circle { pub r: f64 }\n"
+        "pub trait Measurable { fn area(&self) -> f64; }\n"
+        "impl Measurable for Circle {\n"
+        "    fn area(&self) -> f64 { self.r * self.r }\n"
+        "}\n"
+    )
+    rs_chunks = chunker.chunk_source(rs_src, Language.RUST, file_path="circle.rs")
+    impl_chunk = next(c for c in rs_chunks if c.node_kind == "impl_item")
+    assert impl_chunk.symbol_name == "Circle"
+
+    cpp_src = (
+        "class Foo {\n"
+        "public:\n"
+        "    ~Foo() {}\n"
+        "    bool operator==(const Foo& other) const { return true; }\n"
+        "};\n"
+        "int Foo::bar(int x) { return x + 1; }\n"
+    )
+    cpp_chunks = chunker.chunk_source(cpp_src, Language.CPP, file_path="foo.cpp")
+    cpp_syms = {c.symbol_name for c in cpp_chunks}
+    assert "~Foo" in cpp_syms
+    assert "operator==" in cpp_syms
+    assert "bar" in cpp_syms
+
+
+def test_cross_class_same_method_name_call_and_diamond_k_hop_slice() -> None:
+    """Cross-class delegation to a same-named method is linked and diamond k_hop_slice works."""
+    chunker = ASTChunker()
+    py_src = (
+        "class Inner:\n"
+        "    def close(self) -> int:\n"
+        "        return 1\n\n"
+        "class Wrapper:\n"
+        "    def close(self) -> int:\n"
+        "        return self.inner.close()\n"
+    )
+    chunks = chunker.chunk_source(py_src, Language.PYTHON, file_path="wrap.py")
+    cpg = SemanticCPGBuilder()
+    symbols = cpg.build_from_ast_chunks(chunks)
+
+    close_uris = [u for u, s in symbols.items() if s.display_name == "close"]
+    assert len(close_uris) == 2
+    inner_uri, wrapper_uri = sorted(close_uris, key=lambda u: symbols[u].line_start)
+    call_targets = [
+        e.target_id for e in symbols[wrapper_uri].edges if e.kind == CPGEdgeKind.CALLS
+    ]
+    assert inner_uri in call_targets
+
+    # Diamond graph: A -> B -> D and A -> C -> D
+    diamond = SemanticCPGBuilder()
+    ua = make_symbol_uri("pkg", "1.0", "A")
+    ub = make_symbol_uri("pkg", "1.0", "B")
+    uc = make_symbol_uri("pkg", "1.0", "C")
+    ud = make_symbol_uri("pkg", "1.0", "D")
+    diamond.ingest_scip_payload(
+        {
+            "documents": [
+                {
+                    "relative_path": "d.py",
+                    "symbols": [
+                        {"symbol": ua, "display_name": "A", "kind": "func"},
+                        {"symbol": ub, "display_name": "B", "kind": "func"},
+                        {"symbol": uc, "display_name": "C", "kind": "func"},
+                        {"symbol": ud, "display_name": "D", "kind": "func"},
+                    ],
+                    "occurrences": [
+                        {"enclosing_symbol": ua, "symbol": ub, "range": [2]},
+                        {"enclosing_symbol": ua, "symbol": uc, "range": [3]},
+                        {"enclosing_symbol": ub, "symbol": ud, "range": [6]},
+                        {"enclosing_symbol": uc, "symbol": ud, "range": [9]},
+                    ],
+                }
+            ]
+        }
+    )
+    sliced = diamond.k_hop_slice(ua, max_hops=2, direction="both")
+    pairs = {(s["source"], s["target"]) for s in sliced}
+    assert pairs == {(ua, ub), (ua, uc), (ub, ud), (uc, ud)}
+    assert len(sliced) == 4
+
+
+def test_validate_against_ir_calls_no_mangled_ir_only_duplicates() -> None:
+    """validate_against_ir_calls normalizes mangled C++ IR symbols without polluting ir_only."""
+    chunker = ASTChunker()
+    cpp_src = (
+        "int leaf(int x) { return x + 1; }\n"
+        "int caller(int y) { return leaf(y); }\n"
+    )
+    chunks = chunker.chunk_source(cpp_src, Language.CPP, file_path="calls.cpp")
+    cpg = SemanticCPGBuilder()
+    cpg.build_from_ast_chunks(chunks)
+
+    ir_graph = LLVMIRGraph(
+        function_name="_Z6calleri",
+        source_name="caller",
+        source_file="calls.cpp",
+        nodes=[
+            ProGraMLNode(
+                node_id=0,
+                node_type="inst",
+                opcode="call",
+                text="%0 = call noundef i32 @_Z4leafi(i32 noundef %y)",
+            )
+        ],
+    )
+    validation = cpg.validate_against_ir_calls([ir_graph])
+    assert validation["confirmed"] == [("caller", "leaf")]
+    assert validation["ir_only"] == []
+
+
+def test_def_use_self_referential_increment_reaches() -> None:
+    """Self-referential assignments (y = y + 2 and y += 1) preserve incoming REACHES edges."""
+    chunker = ASTChunker()
+    py_src = (
+        "def accumulate(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    y = y + 2\n"
+        "    y += 3\n"
+        "    return y\n"
+    )
+    chunks = chunker.chunk_source(py_src, Language.PYTHON, file_path="acc.py")
+    cpg = SemanticCPGBuilder()
+    cpg.build_from_ast_chunks(chunks)
+
+    reaches = [
+        (u.rsplit(":", 1)[-1], v.rsplit(":", 1)[-1])
+        for u, v, d in cpg.graph.edges(data=True)
+        if d.get("kind") == CPGEdgeKind.REACHES.value and d.get("metadata", {}).get("var") == "y"
+    ]
+    assert ("L2", "L3") in reaches
+    assert ("L3", "L4") in reaches
+    assert ("L4", "L5") in reaches

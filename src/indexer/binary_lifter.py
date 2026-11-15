@@ -86,9 +86,10 @@ _X86_JUMP_MNEMONICS = frozenset(
         "retq",
     }
 )
-_ARM64_JUMP_PREFIXES = ("b.", "b", "bl", "cbz", "cbnz", "tbz", "tbnz", "ret")
+_ARM64_COND_BRANCH_PREFIXES = ("b.", "cbz", "cbnz", "tbz", "tbnz")
+_ARM64_EXACT_BRANCHES = frozenset({"b", "bl", "ret"})
 
-_HEX_OR_DEC_RE = re.compile(r"(?<![A-Za-z0-9_])(-?0x[0-9a-fA-F]+|-?\d+)(?![A-Za-z0-9_])")
+_HEX_OR_DEC_RE = re.compile(r"#?(?<![A-Za-z0-9_])(-?0x[0-9a-fA-F]+|-?\d+)(?![A-Za-z0-9_])")
 _MEM_DISP_RE = re.compile(r"\[\s*(REG_FP|REG_SP|REG_PC)\s*([+-])\s*(?:0x[0-9a-fA-F]+|\d+)\s*\]")
 
 
@@ -99,32 +100,43 @@ def normalize_instruction(mnemonic: str, op_str: str, arch: str = "x86_64") -> s
     if not ops:
         return mn
 
+    mn_low = mnemonic.strip().lower()
     is_jump = (
-        mnemonic.lower() in _X86_JUMP_MNEMONICS
+        mn_low in _X86_JUMP_MNEMONICS
         if arch == "x86_64"
-        else mnemonic.lower().startswith(_ARM64_JUMP_PREFIXES)
+        else (mn_low in _ARM64_EXACT_BRANCHES or mn_low.startswith(_ARM64_COND_BRANCH_PREFIXES))
     )
     if is_jump and re.fullmatch(r"0x[0-9a-fA-F]+|#?0x[0-9a-fA-F]+|\d+", ops):
         return f"{mn} <BB_TARGET>"
 
     reg_map = _X86_REG_MAP if arch == "x86_64" else _ARM64_REG_MAP
     norm_ops = ops
+    has_branch_target_suffix = False
+    if is_jump and "," in norm_ops:
+        prefix_ops, last_op = norm_ops.rsplit(",", 1)
+        if re.fullmatch(r"#?0x[0-9a-fA-F]+", last_op.strip()):
+            norm_ops = prefix_ops
+            has_branch_target_suffix = True
+
     for reg, canonical in reg_map.items():
         norm_ops = re.sub(rf"\b{re.escape(reg)}\b", canonical, norm_ops, flags=re.IGNORECASE)
 
     norm_ops = _MEM_DISP_RE.sub(r"[\1 \2 DISP_LOCAL]", norm_ops)
 
     def _norm_imm(match: re.Match[str]) -> str:
+        full = match.group(0)
         raw = match.group(1)
         try:
             val = int(raw, 16) if "x" in raw.lower() else int(raw, 10)
         except ValueError:
-            return raw
+            return full
         if abs(val) > 256:
             return "<IMM_CONST>"
-        return raw
+        return full
 
     norm_ops = _HEX_OR_DEC_RE.sub(_norm_imm, norm_ops)
+    if has_branch_target_suffix:
+        norm_ops = f"{norm_ops}, <BB_TARGET>"
     norm_ops = re.sub(r"\s+", " ", norm_ops).strip()
     return f"{mn} {norm_ops}"
 
@@ -223,6 +235,8 @@ class BinaryLifter:
             "debuginfo=2",
             "-C",
             "opt-level=1",
+            "-C",
+            "link-dead-code",
             str(src),
             "-o",
             str(target_path),
@@ -426,7 +440,8 @@ class BinaryLifter:
 
     @staticmethod
     def _parse_branch_target(op_str: str) -> int | None:
-        m = re.fullmatch(r"#?(0x[0-9a-fA-F]+)", op_str.strip())
+        last_op = op_str.rsplit(",", 1)[-1].strip()
+        m = re.fullmatch(r"#?(0x[0-9a-fA-F]+)", last_op)
         if m:
             return int(m.group(1), 16)
         return None

@@ -5,15 +5,26 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+import mcp_server.code_index_server as code_index_server
 from indexer.ast_chunker import ASTChunker
 from indexer.binary_lifter import BinaryLifter
 from indexer.llvm_ir_pass import BUILD_TMP_ROOT
 from indexer.models import IRStatus
 from indexer.semantic_cpg import SemanticCPGBuilder
-from mcp_server.code_index_server import CodeIndexPipeline, mcp
+from mcp_server.code_index_server import (
+    CodeIndexPipeline,
+    find_ir_or_binary_clones,
+    get_index_health,
+    index_workspace,
+    inspect_lowering_pipeline,
+    mcp,
+    search_code_hybrid,
+    trace_symbol_dataflow,
+)
 
 
 @given(raw_bytes=st.binary(min_size=0, max_size=256))
@@ -144,12 +155,52 @@ def test_degraded_reason_sanitizes_compiler_source_echo(tmp_path: Path) -> None:
 
 
 def test_mcp_tools_registered() -> None:
-    """Verify all 5 MCP tools are registered on MCPServer."""
+    """Verify all 6 MCP tools are registered on MCPServer."""
     tool_names = {t.name for t in mcp._tool_manager.list_tools()}
-    assert {
+    assert tool_names == {
         "index_workspace",
         "search_code_hybrid",
         "inspect_lowering_pipeline",
         "find_ir_or_binary_clones",
         "trace_symbol_dataflow",
-    }.issubset(tool_names)
+        "get_index_health",
+    }
+
+
+def test_mcp_tool_wrappers_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise all 6 @mcp.tool() entrypoints end-to-end against a temporary pipeline."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "calc.py").write_text(
+        "def scale_pos(x: int) -> int:\n"
+        "    return x * 4\n\n"
+        "def scale_pos_clone(y: int) -> int:\n"
+        "    return y * 4\n\n"
+        "def caller_fn(z: int) -> int:\n"
+        "    return scale_pos(z)\n",
+        encoding="utf-8",
+    )
+    temp_pipe = CodeIndexPipeline(storage_dir=tmp_path / ".idx")
+    monkeypatch.setattr(code_index_server, "_PIPELINE", temp_pipe)
+
+    summary = index_workspace(str(ws))
+    assert summary["indexed_units"] == 3
+
+    hits = search_code_hybrid("scale_pos", top_k=5)
+    assert any(h["symbol_name"] == "scale_pos" for h in hits)
+
+    inspected = inspect_lowering_pipeline("scale_pos")
+    assert inspected["ast"]["symbol_name"] == "scale_pos"
+    scip_uri = str(inspected["scip_symbol"])
+
+    clones = find_ir_or_binary_clones("scale_pos", threshold=0.5, modality="bin_cfg")
+    assert isinstance(clones, list) and len(clones) >= 1
+
+    slices = trace_symbol_dataflow(scip_uri, max_hops=2)
+    assert any("caller_fn#" in item["source"] for item in slices)
+
+    health = get_index_health()
+    assert health["consistent"] is True
+    assert health["sqlite_ok"] is True
+    assert health["cpg_symbols"] == 3
+    temp_pipe.store.close()

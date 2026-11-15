@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
   id-token: write
 
 jobs:
@@ -24,6 +23,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
         if: ${{ vars.GCP_PROJECT_ID != '' && env.GCP_WIF_PROVIDER != '' }}

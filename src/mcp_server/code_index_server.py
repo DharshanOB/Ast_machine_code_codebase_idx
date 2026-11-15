@@ -233,6 +233,33 @@ def _is_path_allowed(target: Path) -> bool:
     return False
 
 
+def _iter_workspace_source_files(root: Path) -> list[tuple[Path, Path, Language]]:
+    """Walk root, pruning hidden and ignored directories in-place before stat/resolve."""
+    found: list[tuple[Path, Path, Language]] = []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        dirnames[:] = sorted(
+            d for d in dirnames if not d.startswith(".") and d not in _IGNORED_DIRS
+        )
+        dir_p = Path(dirpath)
+        for fname in sorted(filenames):
+            if fname.startswith("."):
+                continue
+            lang = detect_language(fname)
+            if lang is None:
+                continue
+            file_path = dir_p / fname
+            try:
+                resolved_file = file_path.resolve()
+                if not resolved_file.is_relative_to(root):
+                    continue
+                if not resolved_file.is_file() or resolved_file.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            found.append((file_path, resolved_file, lang))
+    return found
+
+
 class CodeIndexPipeline:
     """Orchestrates all 4 indexing layers and serves queries via HybridCodeStore."""
 
@@ -247,6 +274,12 @@ class CodeIndexPipeline:
         self._file_hashes: dict[str, str] = {}
         self._file_chunks: dict[str, list[ASTChunkNode]] = {}
         self._file_unit_ids: dict[str, list[str]] = {}
+        self._last_ir_cpg_validation: dict[str, int] = {
+            "confirmed": 0,
+            "cpg_only": 0,
+            "ir_only": 0,
+            "ambiguous": 0,
+        }
         self._lock = threading.RLock()
         self._restore_persistent_state()
 
@@ -272,7 +305,13 @@ class CodeIndexPipeline:
             self.cpg.build_from_ast_chunks(all_chunks)
             ir_graphs = [u.ir_graph for u in self.store.units.values() if u.ir_graph is not None]
             if ir_graphs:
-                self.cpg.validate_against_ir_calls(ir_graphs)
+                val = self.cpg.validate_against_ir_calls(ir_graphs)
+                self._last_ir_cpg_validation = {
+                    "confirmed": len(val["confirmed"]),
+                    "cpg_only": len(val["cpg_only"]),
+                    "ir_only": len(val["ir_only"]),
+                    "ambiguous": len(val["ambiguous"]),
+                }
 
     def index_workspace(
         self,
@@ -303,24 +342,11 @@ class CodeIndexPipeline:
         compile_flags_by_file = self._load_compile_commands(compile_commands_path)
         current_files: dict[str, tuple[Path, str]] = {}
 
-        for file_path in sorted(root.rglob("*")):
-            if not file_path.is_file():
-                continue
+        for file_path, resolved_file, lang in _iter_workspace_source_files(root):
             try:
-                resolved_file = file_path.resolve()
-                if not resolved_file.is_relative_to(root):
-                    continue
-                if resolved_file.stat().st_size > MAX_FILE_BYTES:
-                    continue
+                hasher = hashlib.sha256(resolved_file.read_bytes())
             except OSError:
                 continue
-            rel_parts = file_path.relative_to(root).parts
-            if any(p.startswith(".") or p in _IGNORED_DIRS for p in rel_parts[:-1]):
-                continue
-            lang = detect_language(file_path)
-            if lang is None:
-                continue
-            hasher = hashlib.sha256(resolved_file.read_bytes())
             flags = compile_flags_by_file.get(str(resolved_file), [])
             compiler_bin = ""
             if lang in (Language.C, Language.CPP) and not is_header_file(file_path):
@@ -384,20 +410,22 @@ class CodeIndexPipeline:
                 "deleted_units": 0,
                 "degraded_units": 0,
                 "symbols_count": len(self.cpg.symbols),
-                "ir_cpg_validation": {
-                    "confirmed": 0,
-                    "cpg_only": 0,
-                    "ir_only": 0,
-                    "ambiguous": 0,
-                },
+                "ir_cpg_validation": dict(self._last_ir_cpg_validation),
             }
 
+        stale_set = set(stale_unit_ids)
         staged_symbol_to_unit = dict(self.symbol_to_unit)
-        if stale_unit_ids:
-            stale_set = set(stale_unit_ids)
+        if stale_set:
             staged_symbol_to_unit = {
                 k: v for k, v in staged_symbol_to_unit.items() if v not in stale_set
             }
+            for uid, existing_u in self.store.units.items():
+                if uid in stale_set:
+                    continue
+                if existing_u.scip_symbol is not None:
+                    staged_symbol_to_unit.setdefault(existing_u.scip_symbol.symbol_uri, uid)
+                if existing_u.ast_chunk.symbol_name:
+                    staged_symbol_to_unit.setdefault(existing_u.ast_chunk.symbol_name, uid)
 
         all_chunks = [c for chunk_list in staged_chunks.values() for c in chunk_list]
         next_cpg = SemanticCPGBuilder()
@@ -434,21 +462,42 @@ class CodeIndexPipeline:
                     self._lower_single_file(src_path, chunks, compile_flags_by_file)
                 )
 
+        newly_lowered_ir: list[LLVMIRGraph] = [
+            g for res in lowered_results for g in res[3].values()
+        ]
+        seen_ir_ids: set[int] = set()
+        all_ir_graphs: list[LLVMIRGraph] = []
+        for uid, existing_u in self.store.units.items():
+            if uid in stale_set:
+                continue
+            if existing_u.ir_graph is not None and id(existing_u.ir_graph) not in seen_ir_ids:
+                seen_ir_ids.add(id(existing_u.ir_graph))
+                all_ir_graphs.append(existing_u.ir_graph)
+        for g in newly_lowered_ir:
+            if id(g) not in seen_ir_ids:
+                seen_ir_ids.add(id(g))
+                all_ir_graphs.append(g)
+        ir_cpg_validation = next_cpg.validate_against_ir_calls(all_ir_graphs)
+        validation_counts = {
+            "confirmed": len(ir_cpg_validation["confirmed"]),
+            "cpg_only": len(ir_cpg_validation["cpg_only"]),
+            "ir_only": len(ir_cpg_validation["ir_only"]),
+            "ambiguous": len(ir_cpg_validation["ambiguous"]),
+        }
+
         units: list[UnifiedCodeUnit] = []
-        newly_lowered_ir: list[LLVMIRGraph] = []
         degraded_count = 0
 
         for (
             src_path,
             chunks,
-            lang,
+            lowered_lang,
             ir_by_fn,
             bin_by_fn,
             dwarf_maps,
             elf_subprograms,
             file_error,
         ) in lowered_results:
-            newly_lowered_ir.extend(ir_by_fn.values())
             for chunk in chunks:
                 sym = chunk_to_symbol.get(chunk.chunk_id)
                 ir_graph, bin_blocks = self._match_ir_and_binary(
@@ -457,7 +506,7 @@ class CodeIndexPipeline:
                 reason = ""
                 if ir_graph is not None or bin_blocks:
                     status = IRStatus.OK
-                elif lang == Language.JAVASCRIPT or is_header_file(src_path):
+                elif lowered_lang == Language.JAVASCRIPT or is_header_file(src_path):
                     status = IRStatus.NOT_APPLICABLE
                     if is_header_file(src_path):
                         reason = "Header file; lowered via including translation units"
@@ -467,7 +516,10 @@ class CodeIndexPipeline:
                 if status == IRStatus.DEGRADED:
                     degraded_count += 1
                 unit_mappings = self.dwarf.lookup_va_for_line(
-                    dwarf_maps, chunk.line_start, chunk.line_end
+                    dwarf_maps,
+                    chunk.line_start,
+                    chunk.line_end,
+                    file_path=str(src_path),
                 )
                 unit = UnifiedCodeUnit(
                     ast_chunk=chunk,
@@ -489,6 +541,10 @@ class CodeIndexPipeline:
             p_str: (staged_hashes[p_str], staged_unit_ids.get(p_str, []))
             for p_str in updated_paths
         }
+        for uid, existing_u in self.store.units.items():
+            if uid not in stale_set and existing_u.ast_chunk.chunk_id in chunk_to_symbol:
+                existing_u.scip_symbol = chunk_to_symbol[existing_u.ast_chunk.chunk_id]
+
         # Persist batch BEFORE committing in-memory incremental cache state.
         count, deleted_count = self.store.apply_batch(
             upsert_units=units,
@@ -502,18 +558,7 @@ class CodeIndexPipeline:
         self._file_unit_ids = staged_unit_ids
         self.symbol_to_unit = staged_symbol_to_unit
         self.cpg = next_cpg
-
-        seen_ir_ids: set[int] = set()
-        all_ir_graphs: list[LLVMIRGraph] = []
-        for u in self.store.units.values():
-            if u.ir_graph is not None and id(u.ir_graph) not in seen_ir_ids:
-                seen_ir_ids.add(id(u.ir_graph))
-                all_ir_graphs.append(u.ir_graph)
-        for g in newly_lowered_ir:
-            if id(g) not in seen_ir_ids:
-                seen_ir_ids.add(id(g))
-                all_ir_graphs.append(g)
-        ir_cpg_validation = self.cpg.validate_against_ir_calls(all_ir_graphs)
+        self._last_ir_cpg_validation = validation_counts
 
         return {
             "indexed_units": count,
@@ -521,12 +566,7 @@ class CodeIndexPipeline:
             "deleted_units": deleted_count,
             "degraded_units": degraded_count,
             "symbols_count": len(symbols),
-            "ir_cpg_validation": {
-                "confirmed": len(ir_cpg_validation["confirmed"]),
-                "cpg_only": len(ir_cpg_validation["cpg_only"]),
-                "ir_only": len(ir_cpg_validation["ir_only"]),
-                "ambiguous": len(ir_cpg_validation["ambiguous"]),
-            },
+            "ir_cpg_validation": dict(validation_counts),
         }
 
     def _lower_single_file(
@@ -742,12 +782,21 @@ class CodeIndexPipeline:
     def _load_compile_commands(cc_path: str | Path | None) -> dict[str, list[str]]:
         if cc_path is None:
             return {}
-        path = Path(cc_path)
-        if not path.exists():
+        try:
+            path = Path(cc_path).resolve()
+            if not _is_path_allowed(path) or not path.is_file():
+                return {}
+            if path.stat().st_size > MAX_FILE_BYTES:
+                return {}
+            entries = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
             return {}
-        entries = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(entries, list):
+            return {}
         out: dict[str, list[str]] = {}
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             raw_file = str(entry.get("file", ""))
             if not raw_file:
                 continue
@@ -766,9 +815,20 @@ class CodeIndexPipeline:
         return out
 
 
-_PIPELINE = CodeIndexPipeline(
-    storage_dir=os.environ.get("ASTRAEA_STORAGE_DIR") or None
-)
+_PIPELINE: CodeIndexPipeline | None = None
+_PIPELINE_LOCK = threading.Lock()
+
+
+def _get_pipeline() -> CodeIndexPipeline:
+    """Lazily initialize the default MCP server pipeline singleton on first tool call."""
+    global _PIPELINE
+    if _PIPELINE is None:
+        with _PIPELINE_LOCK:
+            if _PIPELINE is None:
+                _PIPELINE = CodeIndexPipeline(
+                    storage_dir=os.environ.get("ASTRAEA_STORAGE_DIR") or None
+                )
+    return _PIPELINE
 
 
 @mcp.tool()
@@ -776,7 +836,7 @@ def index_workspace(
     repo_path: str, compile_commands_path: str | None = None, incremental: bool = True
 ) -> dict[str, Any]:
     """Index a repository across AST, SCIP/CPG, LLVM IR, and disassembled Machine Code."""
-    return _PIPELINE.index_workspace(
+    return _get_pipeline().index_workspace(
         repo_path, compile_commands_path, incremental=incremental
     )
 
@@ -787,7 +847,7 @@ def search_code_hybrid(
 ) -> list[dict[str, Any]]:
     """Search indexed code units using weighted Reciprocal Rank Fusion across modalities."""
     bounded_k = max(1, min(top_k, 100))
-    hits = _PIPELINE.store.rrf_search(query=query, layers=layers, top_k=bounded_k)
+    hits = _get_pipeline().store.rrf_search(query=query, layers=layers, top_k=bounded_k)
     return [h.model_dump() for h in hits]
 
 
@@ -796,7 +856,7 @@ def inspect_lowering_pipeline(
     symbol_or_function: str, bb_cursor: int = 0
 ) -> dict[str, Any]:
     """Inspect AST, SCIP symbol, LLVM IR, and paginated machine-code CFG for a function."""
-    return _PIPELINE.inspect_lowering_pipeline(symbol_or_function, bb_cursor=bb_cursor)
+    return _get_pipeline().inspect_lowering_pipeline(symbol_or_function, bb_cursor=bb_cursor)
 
 
 @mcp.tool()
@@ -804,8 +864,9 @@ def find_ir_or_binary_clones(
     function_id: str, threshold: float = 0.75, modality: str = "ir_structural"
 ) -> list[dict[str, Any]]:
     """Find semantically equivalent functions across optimization levels or syntax variants."""
-    uid = _PIPELINE.symbol_to_unit.get(function_id, function_id)
-    clones = _PIPELINE.store.find_clones(uid, modality=modality, threshold=threshold)
+    pipe = _get_pipeline()
+    uid = pipe.symbol_to_unit.get(function_id, function_id)
+    clones = pipe.store.find_clones(uid, modality=modality, threshold=threshold)
     return [{"unit_id": cid, "similarity": score} for cid, score in clones]
 
 
@@ -813,7 +874,7 @@ def find_ir_or_binary_clones(
 def trace_symbol_dataflow(symbol_id: str, max_hops: int = 2) -> list[dict[str, Any]]:
     """Trace cycle-safe k-hop caller/callee and data-flow edges for a SCIP symbol URI."""
     bounded_hops = max(1, min(max_hops, 5))
-    slices = _PIPELINE.cpg.k_hop_slice(symbol_id, max_hops=bounded_hops)
+    slices = _get_pipeline().cpg.k_hop_slice(symbol_id, max_hops=bounded_hops)
     max_chars = DEFAULT_TOKEN_BUDGET * CHARS_PER_TOKEN_ESTIMATE
     out: list[dict[str, Any]] = []
     running_chars = 2
@@ -829,11 +890,12 @@ def trace_symbol_dataflow(symbol_id: str, max_hops: int = 2) -> list[dict[str, A
 @mcp.tool()
 def get_index_health() -> dict[str, Any]:
     """Return storage consistency, SQLite health, and CPG symbol/edge counts."""
-    with _PIPELINE._lock:
+    pipe = _get_pipeline()
+    with pipe._lock:
         return {
-            **_PIPELINE.store.health_check(),
-            "cpg_symbols": len(_PIPELINE.cpg.symbols),
-            "cpg_edges": _PIPELINE.cpg.graph.number_of_edges(),
+            **pipe.store.health_check(),
+            "cpg_symbols": len(pipe.cpg.symbols),
+            "cpg_edges": pipe.cpg.graph.number_of_edges(),
         }
 
 
@@ -849,8 +911,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     args, _ = parser.parse_known_args(argv)
     target_dir = Path(args.storage_dir) if args.storage_dir else None
-    if target_dir != _PIPELINE.store.storage_dir:
-        _PIPELINE.store.close()
+    if _PIPELINE is None or target_dir != _PIPELINE.store.storage_dir:
+        if _PIPELINE is not None:
+            _PIPELINE.store.close()
         _PIPELINE = CodeIndexPipeline(storage_dir=target_dir)
     mcp.run(transport="stdio")
 

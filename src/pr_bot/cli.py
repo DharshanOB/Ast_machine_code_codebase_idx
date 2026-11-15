@@ -15,6 +15,7 @@ from pr_bot.analyzer import (
     analyze_git_pr,
     analyze_repository,
     resolve_merge_base,
+    validate_git_ref,
 )
 from pr_bot.gemini_reviewer import generate_vertex_gemini_review
 
@@ -37,7 +38,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile-commands", default=None, help="Optional compile_commands.json.")
     parser.add_argument("--out-md", default="pr_review_summary.md", help="Output Markdown path.")
     parser.add_argument(
-        "--out-comments", default="pr_review_comments.json", help="Output inline comments JSON."
+        "--out-comments",
+        default=None,
+        help="Output inline comments JSON (defaults to pr_review_comments.json in pr mode).",
     )
     parser.add_argument(
         "--vertex-project",
@@ -74,17 +77,19 @@ def main(argv: list[str] | None = None) -> int:
             )
         inline_comments = []
     else:
+        base_ref = validate_git_ref(args.base)
+        head_ref = validate_git_ref(args.head)
         report = analyze_git_pr(
             repo_path=args.repo,
-            base_ref=args.base,
-            head_ref=args.head,
+            base_ref=base_ref,
+            head_ref=head_ref,
             compile_commands_path=args.compile_commands,
         )
         inline_comments = report.to_github_review_comments()
         repo_root = Path(args.repo).resolve()
-        effective_base = resolve_merge_base(repo_root, args.base, args.head)
+        effective_base = resolve_merge_base(repo_root, base_ref, head_ref)
         diff_proc = subprocess.run(
-            ["git", "-C", str(repo_root), "diff", effective_base, args.head],
+            ["git", "-C", str(repo_root), "diff", effective_base, head_ref],
             shell=False,
             capture_output=True,
             text=True,
@@ -130,7 +135,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     Path(args.out_md).write_text(markdown, encoding="utf-8")
-    Path(args.out_comments).write_text(json.dumps(inline_comments, indent=2), encoding="utf-8")
+    comments_out: str | None = (
+        args.out_comments
+        if args.mode == "repo"
+        else (args.out_comments or "pr_review_comments.json")
+    )
+    if comments_out is not None:
+        Path(comments_out).write_text(json.dumps(inline_comments, indent=2), encoding="utf-8")
     return 0
 
 

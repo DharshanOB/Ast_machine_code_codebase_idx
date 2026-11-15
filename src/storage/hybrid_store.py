@@ -223,6 +223,33 @@ class HybridCodeStore:
         )
         return doc, vectors, pid, point
 
+    def _rebuild_memory_graph(self, commit_sha: str = "working-tree") -> None:
+        """Rebuild self.graph over active unit_ids so deleted/SCIP nodes never leak."""
+        self.graph.clear()
+        uri_to_uid: dict[str, str] = {}
+        for uid, unit in self.units.items():
+            ast = unit.ast_chunk
+            self.graph.add_node(
+                uid,
+                symbol_name=ast.symbol_name,
+                file_path=ast.file_path,
+                commit_sha=commit_sha,
+            )
+            if unit.scip_symbol is not None:
+                uri_to_uid[unit.scip_symbol.symbol_uri] = uid
+        for uid, unit in self.units.items():
+            if unit.scip_symbol is None:
+                continue
+            for edge in unit.scip_symbol.edges:
+                target_uid = uri_to_uid.get(edge.target_id)
+                if target_uid is not None:
+                    self.graph.add_edge(
+                        uid,
+                        target_uid,
+                        kind=edge.kind.value,
+                        line=edge.line,
+                    )
+
     def _add_units_to_memory(
         self,
         staged_units: dict[str, UnifiedCodeUnit],
@@ -235,21 +262,7 @@ class HybridCodeStore:
             self.units[uid] = unit
             self.unit_vectors[uid] = staged_vectors[uid]
             self._point_ids[uid] = staged_point_ids[uid]
-            ast = unit.ast_chunk
-            self.graph.add_node(
-                uid,
-                symbol_name=ast.symbol_name,
-                file_path=ast.file_path,
-                commit_sha=commit_sha,
-            )
-            if unit.scip_symbol is not None:
-                for edge in unit.scip_symbol.edges:
-                    self.graph.add_edge(
-                        edge.source_id,
-                        edge.target_id,
-                        kind=edge.kind.value,
-                        line=edge.line,
-                    )
+        self._rebuild_memory_graph(commit_sha)
 
     def upsert_units(
         self, units: list[UnifiedCodeUnit], commit_sha: str = "working-tree"
@@ -326,12 +339,17 @@ class HybridCodeStore:
             if uid in self.units:
                 self.units.pop(uid, None)
                 self.unit_vectors.pop(uid, None)
-                if uid in self.graph:
-                    self.graph.remove_node(uid)
                 removed += 1
+        self._rebuild_memory_graph()
 
         if self._db_path is not None:
+            active_ids = sorted(self.units)
+            payload = json.dumps({"unit_count": len(active_ids), "unit_ids": active_ids})
             with self._connect_sqlite() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO snapshots (commit_sha, payload_json) VALUES (?, ?)",
+                    ("working-tree", payload),
+                )
                 conn.executemany(
                     "DELETE FROM tombstones WHERE unit_id = ?",
                     [(u,) for u in unit_ids],
@@ -413,7 +431,16 @@ class HybridCodeStore:
 
         # Phase 3: commit SQLite units, snapshot summary, file_state, and tombstones atomically.
         if self._db_path is not None:
+            active_ids = sorted(
+                (set(self.units) - set(delete_unit_ids)) | {u.unit_id for u in upsert_units}
+            )
             with self._connect_sqlite() as conn:
+                if delete_unit_ids or upsert_units:
+                    payload = json.dumps({"unit_count": len(active_ids), "unit_ids": active_ids})
+                    conn.execute(
+                        "INSERT OR REPLACE INTO snapshots (commit_sha, payload_json) VALUES (?, ?)",
+                        (commit_sha, payload),
+                    )
                 if delete_unit_ids:
                     conn.executemany(
                         "DELETE FROM units WHERE unit_id = ?",
@@ -428,14 +455,7 @@ class HybridCodeStore:
                         )
                 if upsert_units:
                     upserted_ids = [u.unit_id for u in upsert_units]
-                    payload = json.dumps(
-                        {"unit_count": len(upsert_units), "unit_ids": upserted_ids}
-                    )
                     unit_rows = [(u.unit_id, commit_sha, u.model_dump_json()) for u in upsert_units]
-                    conn.execute(
-                        "INSERT OR REPLACE INTO snapshots (commit_sha, payload_json) VALUES (?, ?)",
-                        (commit_sha, payload),
-                    )
                     conn.executemany(
                         "INSERT OR REPLACE INTO units (unit_id, commit_sha, unit_json)"
                         " VALUES (?, ?, ?)",
@@ -473,12 +493,12 @@ class HybridCodeStore:
             if uid in self.units:
                 self.units.pop(uid, None)
                 self.unit_vectors.pop(uid, None)
-                if uid in self.graph:
-                    self.graph.remove_node(uid)
                 removed_count += 1
 
         if staged_units:
             self._add_units_to_memory(staged_units, staged_vectors, staged_point_ids, commit_sha)
+        else:
+            self._rebuild_memory_graph(commit_sha)
 
         return len(upsert_units), removed_count
 
@@ -516,18 +536,6 @@ class HybridCodeStore:
                     [(uid,) for uid in tombstone_ids],
                 )
 
-        self._reconcile_stray_ids(active_ids)
-
-        for stale_uid in [uid for uid in self.units if uid not in active_ids]:
-            self.units.pop(stale_uid, None)
-            self.unit_vectors.pop(stale_uid, None)
-            self._point_ids.pop(stale_uid, None)
-            if stale_uid in self.graph:
-                self.graph.remove_node(stale_uid)
-
-        if not recovered:
-            return 0
-
         tantivy_count = self._tantivy_index.searcher().num_docs
         qdrant_count = int(self._qdrant.get_collection(self.COLLECTION_NAME).points_count or 0)
         needs_secondary_sync = (
@@ -535,6 +543,17 @@ class HybridCodeStore:
             or tantivy_count != len(recovered)
             or qdrant_count != len(recovered)
         )
+        if needs_secondary_sync:
+            self._reconcile_stray_ids(active_ids)
+
+        for stale_uid in [uid for uid in self.units if uid not in active_ids]:
+            self.units.pop(stale_uid, None)
+            self.unit_vectors.pop(stale_uid, None)
+            self._point_ids.pop(stale_uid, None)
+
+        if not recovered:
+            self._rebuild_memory_graph()
+            return 0
 
         staged_units: dict[str, UnifiedCodeUnit] = {}
         staged_vectors: dict[str, dict[str, list[float]]] = {}
@@ -959,7 +978,8 @@ class HybridCodeStore:
         if self._db_path is None:
             return
         unit_ids = [u.unit_id for u in units]
-        payload = json.dumps({"unit_count": len(units), "unit_ids": unit_ids})
+        active_ids = sorted(set(self.units) | set(unit_ids))
+        payload = json.dumps({"unit_count": len(active_ids), "unit_ids": active_ids})
         unit_rows = [(u.unit_id, commit_sha, u.model_dump_json()) for u in units]
         with self._connect_sqlite() as conn:
             conn.execute(

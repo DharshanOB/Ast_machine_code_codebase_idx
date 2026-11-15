@@ -94,6 +94,23 @@ def _collect_connected_sources(
     return connected
 
 
+_GIT_REF_RE = re.compile(r"^[A-Za-z0-9._/][A-Za-z0-9._/~^-]{0,255}$")
+
+
+def validate_git_ref(ref: str) -> str:
+    """Validate a git revision ref, rejecting option-injection leading dashes and control chars."""
+    cleaned = ref.strip()
+    if ".." in cleaned or not _GIT_REF_RE.match(cleaned):
+        raise ValueError(f"Invalid or unsafe git ref: {ref!r}")
+    return cleaned
+
+
+def _sanitize_md_inline(text: object) -> str:
+    """Sanitize dynamic strings interpolated into Markdown tables, bullets, and Mermaid nodes."""
+    raw = str(text).replace("\r", " ").replace("\n", " ")
+    return raw.replace("`", "'").replace("|", "/").replace('"', "'")
+
+
 class ReviewFinding(BaseModel):
     """Actionable PR finding anchored to a file and line."""
 
@@ -105,6 +122,7 @@ class ReviewFinding(BaseModel):
     line: int = Field(ge=1)
     symbol_name: str
     message: str
+    side: str = Field(default="RIGHT", description="RIGHT or LEFT")
 
 
 class FunctionDelta(BaseModel):
@@ -135,10 +153,12 @@ class PRReviewReport(BaseModel):
 
     def to_markdown(self) -> str:
         """Render a rich GitHub PR summary comment with compiler & CPG evidence."""
+        safe_base = _sanitize_md_inline(self.base_ref)
+        safe_head = _sanitize_md_inline(self.head_ref)
         lines: list[str] = [
             "## Astraea 4-Layer PR Review (AST -> CPG -> LLVM IR -> Machine Code)",
             "",
-            f"**Base:** `{self.base_ref}` | **Head:** `{self.head_ref}` | "
+            f"**Base:** `{safe_base}` | **Head:** `{safe_head}` | "
             f"**Modified Functions:** {len(self.changed_functions)} | "
             f"**Findings:** {len(self.findings)}",
             "",
@@ -166,8 +186,10 @@ class PRReviewReport(BaseModel):
                     else str(fn.binary_blocks_after)
                 )
                 status = "NFC Verified" if fn.nfc_verified else "Modified"
+                safe_sym = _sanitize_md_inline(fn.symbol_name)
+                safe_file = _sanitize_md_inline(fn.file_path)
                 lines.append(
-                    f"| `{fn.symbol_name}` | `{fn.file_path}` | {c_delta} | {ir_sim} | "
+                    f"| `{safe_sym}` | `{safe_file}` | {c_delta} | {ir_sim} | "
                     f"{bb_str} | {len(fn.blast_radius_callers)} callers | {status} |"
                 )
             lines.append("")
@@ -175,14 +197,17 @@ class PRReviewReport(BaseModel):
         if self.findings:
             lines.extend(["### Findings", ""])
             for f in self.findings:
+                safe_f_file = _sanitize_md_inline(f.file_path)
+                safe_f_sym = _sanitize_md_inline(f.symbol_name)
+                safe_f_msg = _sanitize_md_inline(f.message)
                 lines.append(
-                    f"- **[{f.severity}] {f.category}** (`{f.file_path}:{f.line}` "
-                    f"in `{f.symbol_name}`): {f.message}"
+                    f"- **[{f.severity}] {f.category}** (`{safe_f_file}:{f.line}` "
+                    f"in `{safe_f_sym}`): {safe_f_msg}"
                 )
             lines.append("")
 
         callers_edges = [
-            (fn.symbol_name, caller)
+            (_sanitize_md_inline(fn.symbol_name), _sanitize_md_inline(caller))
             for fn in self.changed_functions
             for caller in fn.blast_radius_callers
         ]
@@ -200,7 +225,7 @@ class PRReviewReport(BaseModel):
             {
                 "path": f.file_path,
                 "line": f.line,
-                "side": "RIGHT",
+                "side": f.side,
                 "body": f"**[{f.severity}] {f.category}** (`{f.symbol_name}`)\n\n{f.message}",
             }
             for f in self.findings
@@ -251,10 +276,8 @@ class RepoReviewReport(BaseModel):
         if self.delta_summary:
             lines.extend(["### Changes Since Last Run", ""])
             if "baseline_error" in self.delta_summary:
-                lines.append(
-                    f"- **Baseline Warning:** Failed to load baseline "
-                    f"({self.delta_summary['baseline_error']})"
-                )
+                safe_err = _sanitize_md_inline(self.delta_summary["baseline_error"])
+                lines.append(f"- **Baseline Warning:** Failed to load baseline ({safe_err})")
             else:
                 new_h = self.delta_summary.get("new_hotspots", [])
                 worsened = self.delta_summary.get("worsened_hotspots", [])
@@ -265,19 +288,22 @@ class RepoReviewReport(BaseModel):
                     f"**Resolved:** {len(resolved)}"
                 )
                 for item in new_h[:10]:
-                    lines.append(f"  - `[NEW]` `{item['key']}` (CC={item['complexity']})")
+                    safe_key = _sanitize_md_inline(item["key"])
+                    lines.append(f"  - `[NEW]` `{safe_key}` (CC={item['complexity']})")
                 for item in worsened[:10]:
+                    safe_key = _sanitize_md_inline(item["key"])
                     lines.append(
-                        f"  - `[WORSENED]` `{item['key']}` (CC {item['before']} -> {item['after']})"
+                        f"  - `[WORSENED]` `{safe_key}` (CC {item['before']} -> {item['after']})"
                     )
             lines.append("")
 
         if self.degraded_details:
             lines.extend(["### Degraded Units", ""])
             for d in self.degraded_details[:20]:
-                lines.append(
-                    f"- `{d['file_path']}` (`{d['symbol_name']}`): {d['reason']}"
-                )
+                safe_d_file = _sanitize_md_inline(d["file_path"])
+                safe_d_sym = _sanitize_md_inline(d["symbol_name"])
+                safe_d_reason = _sanitize_md_inline(d["reason"])
+                lines.append(f"- `{safe_d_file}` (`{safe_d_sym}`): {safe_d_reason}")
             lines.append("")
 
         if self.hotspots:
@@ -290,8 +316,10 @@ class RepoReviewReport(BaseModel):
                 ]
             )
             for h in self.hotspots:
+                safe_h_sym = _sanitize_md_inline(h["symbol_name"])
+                safe_h_file = _sanitize_md_inline(h["file_path"])
                 lines.append(
-                    f"| `{h['symbol_name']}` | `{h['file_path']}` | "
+                    f"| `{safe_h_sym}` | `{safe_h_file}` | "
                     f"{h['complexity']} | {h['callers']} |"
                 )
             lines.append("")
@@ -299,7 +327,7 @@ class RepoReviewReport(BaseModel):
         if self.clone_clusters:
             lines.extend(["### Semantic / IR Clone Clusters", ""])
             for cl in self.clone_clusters:
-                members = ", ".join(f"`{m}`" for m in cl["members"])
+                members = ", ".join(f"`{_sanitize_md_inline(m)}`" for m in cl["members"])
                 lines.append(
                     f"- **Cluster ({len(cl['members'])} members, "
                     f"similarity={cl['min_similarity']:.3f}–{cl['max_similarity']:.3f}):** "
@@ -309,17 +337,20 @@ class RepoReviewReport(BaseModel):
         elif self.clone_pairs:
             lines.extend(["### Semantic / IR Clone Pairs", ""])
             for c in self.clone_pairs:
-                lines.append(
-                    f"- `{c['source']}` ↔ `{c['target']}` (similarity={c['similarity']:.3f})"
-                )
+                safe_src = _sanitize_md_inline(c["source"])
+                safe_dst = _sanitize_md_inline(c["target"])
+                lines.append(f"- `{safe_src}` ↔ `{safe_dst}` (similarity={c['similarity']:.3f})")
             lines.append("")
 
         if self.findings:
             lines.extend(["### Findings", ""])
             for f in self.findings:
+                safe_f_file = _sanitize_md_inline(f.file_path)
+                safe_f_sym = _sanitize_md_inline(f.symbol_name)
+                safe_f_msg = _sanitize_md_inline(f.message)
                 lines.append(
-                    f"- **[{f.severity}] {f.category}** (`{f.file_path}:{f.line}` "
-                    f"in `{f.symbol_name}`): {f.message}"
+                    f"- **[{f.severity}] {f.category}** (`{safe_f_file}:{f.line}` "
+                    f"in `{safe_f_sym}`): {safe_f_msg}"
                 )
             lines.append("")
         return "\n".join(lines)
@@ -346,8 +377,10 @@ def parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
             raw_count = hunk_match.group(2)
             count = int(raw_count) if raw_count is not None else 1
             if count == 0:
-                anchor = max(1, start)
-                changed[current_file].append((anchor, anchor))
+                if start <= 0:
+                    changed[current_file].append((1, 1))
+                else:
+                    changed[current_file].append((start, start + 1))
             else:
                 end = start + count - 1
                 changed[current_file].append((start, end))
@@ -399,7 +432,7 @@ def _index_units_by_key(
     for unit in ordered:
         rel = _rel_path(unit.ast_chunk.file_path, root)
         sym = unit.ast_chunk.symbol_name
-        if not sym:
+        if not sym or unit.ast_chunk.node_kind in _CONTAINER_NODE_TYPES:
             continue
         scope = _container_scope(unit.ast_chunk.scope_header)
         base_key = (rel, scope, sym)
@@ -637,6 +670,7 @@ def analyze_pr_directories(
                         f"Deleted function had {len(base_callers)} downstream caller(s) "
                         "in base CPG."
                     ),
+                    side="LEFT",
                 )
             )
 
@@ -651,6 +685,8 @@ def analyze_pr_directories(
 
 def resolve_merge_base(repo: Path, base_ref: str, head_ref: str) -> str:
     """Resolve the merge-base of base_ref and head_ref, falling back to base_ref."""
+    base_ref = validate_git_ref(base_ref)
+    head_ref = validate_git_ref(head_ref)
     proc = subprocess.run(
         ["git", "-C", str(repo), "merge-base", base_ref, head_ref],
         shell=False,
@@ -706,6 +742,8 @@ def analyze_git_pr(
     compile_commands_path: str | Path | None = None,
 ) -> PRReviewReport:
     """Run base-vs-head 4-layer PR analysis using isolated git worktrees."""
+    base_ref = validate_git_ref(base_ref)
+    head_ref = validate_git_ref(head_ref)
     repo = Path(repo_path).resolve()
     effective_base = resolve_merge_base(repo, base_ref, head_ref)
     diff_proc = subprocess.run(
@@ -863,11 +901,12 @@ def analyze_repository(
             has_native_lowering = True
 
         if unit.ir_status == IRStatus.DEGRADED:
-            reason = (
-                "Tree-sitter syntax error"
-                if ast.has_syntax_error
-                else "Compiler/bytecode lowering unavailable or failed"
-            )
+            if ast.has_syntax_error:
+                reason = "Tree-sitter syntax error"
+            elif unit.degraded_reason:
+                reason = unit.degraded_reason
+            else:
+                reason = "Compiler/bytecode lowering unavailable or failed"
             degraded_details.append(
                 {"file_path": rel, "symbol_name": sym_name, "reason": reason}
             )

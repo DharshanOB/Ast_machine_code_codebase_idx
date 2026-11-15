@@ -562,3 +562,111 @@ def test_pipeline_atomic_rollback_and_allowlist_and_max_bytes(
         assert not any(p.endswith("huge.py") for p in indexed_files)
     finally:
         pipe.store.close()
+
+
+def test_store_graph_edges_cleaned_on_delete_and_recovery(tmp_path: Path) -> None:
+    """HybridCodeStore.graph contains only unit_id nodes and cleans edges on delete/recovery."""
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    a_py = repo_dir / "a.py"
+    b_py = repo_dir / "b.py"
+    a_py.write_text("def callee(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    b_py.write_text("def caller(y: int) -> int:\n    return callee(y)\n", encoding="utf-8")
+
+    storage_dir = tmp_path / "idx"
+    pipe = CodeIndexPipeline(storage_dir=storage_dir)
+    try:
+        pipe.index_workspace(repo_dir)
+        assert pipe.store.graph.number_of_nodes() == len(pipe.store.units) == 2
+        assert pipe.store.graph.number_of_edges() == 1
+
+        b_py.unlink()
+        pipe.index_workspace(repo_dir, incremental=True)
+        assert pipe.store.graph.number_of_nodes() == len(pipe.store.units) == 1
+        assert pipe.store.graph.number_of_edges() == 0
+    finally:
+        pipe.store.close()
+
+    reopened = HybridCodeStore(storage_dir=storage_dir)
+    try:
+        assert reopened.graph.number_of_nodes() == len(reopened.units) == 1
+        assert reopened.graph.number_of_edges() == 0
+    finally:
+        reopened.close()
+
+
+def test_incremental_noop_preserves_ir_cpg_validation_and_persists_confirmed_edges(
+    tmp_path: Path,
+) -> None:
+    """Incremental no-op preserves ir_cpg_validation and persists confirmed CPG edges to SQLite."""
+    if resolve_clang_binary() is None:
+        pytest.skip("clang binary not available")
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "calls.c").write_text(
+        "__attribute__((noinline)) int leaf(int x) { return x + 1; }\n"
+        "int caller(int y) { return leaf(y) * 2; }\n",
+        encoding="utf-8",
+    )
+    storage_dir = tmp_path / "idx"
+    pipe = CodeIndexPipeline(storage_dir=storage_dir)
+    try:
+        first = pipe.index_workspace(repo_dir)
+        assert first["ir_cpg_validation"]["confirmed"] >= 1
+        second = pipe.index_workspace(repo_dir, incremental=True)
+        assert second["skipped_unchanged_files"] == 1
+        assert second["ir_cpg_validation"]["confirmed"] >= 1
+    finally:
+        pipe.store.close()
+
+    reopened = HybridCodeStore(storage_dir=storage_dir)
+    try:
+        caller_unit = next(
+            u for u in reopened.units.values() if u.ast_chunk.symbol_name == "caller"
+        )
+        assert caller_unit.scip_symbol is not None
+        assert any(e.confidence == "confirmed" for e in caller_unit.scip_symbol.edges)
+    finally:
+        reopened.close()
+
+
+def test_duplicate_symbol_name_backfilled_after_file_deletion(tmp_path: Path) -> None:
+    """Deleting one of two files defining helper() backfills symbol_to_unit['helper']."""
+    repo_dir = tmp_path / "repo"
+    (repo_dir / "a").mkdir(parents=True)
+    (repo_dir / "b").mkdir(parents=True)
+    f_a = repo_dir / "a" / "mod.py"
+    f_b = repo_dir / "b" / "mod.py"
+    f_a.write_text("def helper(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    f_b.write_text("def helper(x: int) -> int:\n    return x + 2\n", encoding="utf-8")
+
+    pipe = CodeIndexPipeline(storage_dir=tmp_path / "idx")
+    try:
+        pipe.index_workspace(repo_dir)
+        assert "helper" in pipe.symbol_to_unit
+        f_a.unlink()
+        pipe.index_workspace(repo_dir, incremental=True)
+        assert "helper" in pipe.symbol_to_unit
+        inspected = pipe.inspect_lowering_pipeline("helper")
+        assert "error" not in inspected
+        assert inspected["ast"]["symbol_name"] == "helper"
+    finally:
+        pipe.store.close()
+
+
+def test_compile_commands_outside_allowed_roots_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_load_compile_commands rejects paths outside ASTRAEA_ALLOWED_ROOTS."""
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cc_outside = outside / "compile_commands.json"
+    cc_outside.write_text(
+        json.dumps([{"directory": str(allowed), "file": "main.c", "arguments": ["clang", "-O2"]}]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASTRAEA_ALLOWED_ROOTS", str(allowed))
+    assert CodeIndexPipeline._load_compile_commands(cc_outside) == {}

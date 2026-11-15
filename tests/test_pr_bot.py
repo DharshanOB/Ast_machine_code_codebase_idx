@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from indexer.llvm_ir_pass import resolve_clang_binary
 from pr_bot.analyzer import (
+    PRReviewReport,
     analyze_git_pr,
     analyze_pr_directories,
     analyze_repository,
     parse_unified_diff,
+    validate_git_ref,
 )
 from pr_bot.cli import main as cli_main
-from pr_bot.gemini_reviewer import build_review_prompt
+from pr_bot.gemini_reviewer import build_review_prompt, generate_vertex_gemini_review
 
 
 def test_parse_unified_diff() -> None:
@@ -360,3 +363,204 @@ def test_remap_compile_commands_for_worktree(tmp_path: Path) -> None:
     assert data[0]["directory"] == str(wt_root.resolve())
     assert data[0]["file"] == str(wt_root.resolve() / "src" / "main.c")
     assert f"-I{wt_root.resolve() / 'include'}" in data[0]["arguments"]
+
+
+def test_pr_bot_skips_enclosing_class_container_and_handles_pure_deletion_hunk(
+    tmp_path: Path,
+) -> None:
+    """Modifying a class method or deleting its first line should only report the method."""
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    base.mkdir()
+    head.mkdir()
+
+    (base / "svc.py").write_text(
+        "# header\n"
+        "def top_fn(x: int) -> int:\n"
+        "    y = x + 1\n"
+        "    return y\n\n"
+        "class Svc:\n"
+        "    def a(self, x: int) -> int:\n"
+        "        return x + 1\n",
+        encoding="utf-8",
+    )
+    (head / "svc.py").write_text(
+        "# header\n"
+        "def top_fn(x: int) -> int:\n"
+        "    return x\n\n"
+        "class Svc:\n"
+        "    def a(self, x: int) -> int:\n"
+        "        return x + 2\n",
+        encoding="utf-8",
+    )
+    # Pure-deletion hunk at line 1 (immediately before def top_fn on line 2) + method edit
+    diff_text = (
+        "diff --git a/svc.py b/svc.py\n"
+        "--- a/svc.py\n"
+        "+++ b/svc.py\n"
+        "@@ -2,1 +1,0 @@\n"
+        "@@ -8,1 +7,1 @@\n"
+    )
+    report = analyze_pr_directories(base, head, diff_text=diff_text)
+    changed_syms = {fn.symbol_name for fn in report.changed_functions}
+    assert "Svc" not in changed_syms
+    assert changed_syms == {"top_fn", "a"}
+
+
+def test_deleted_function_review_comment_uses_left_side(tmp_path: Path) -> None:
+    """Deleted-function BLAST_RADIUS findings must set side='LEFT' on GitHub comments."""
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    base.mkdir()
+    head.mkdir()
+    (base / "mod.py").write_text(
+        "def old_helper(x: int) -> int:\n    return x + 1\n\n"
+        "def caller(x: int) -> int:\n    return old_helper(x)\n",
+        encoding="utf-8",
+    )
+    (head / "mod.py").write_text(
+        "def caller(x: int) -> int:\n    return x\n",
+        encoding="utf-8",
+    )
+    diff_text = (
+        "diff --git a/mod.py b/mod.py\n"
+        "--- a/mod.py\n"
+        "+++ b/mod.py\n"
+        "@@ -1,5 +1,2 @@\n"
+    )
+    report = analyze_pr_directories(base, head, diff_text=diff_text)
+    comments = report.to_github_review_comments()
+    deleted_comment = next(c for c in comments if "old_helper" in c["body"])
+    assert deleted_comment["side"] == "LEFT"
+
+
+def test_validate_git_ref_rejects_flag_injection() -> None:
+    """validate_git_ref must reject leading dashes, '..' traversal, and control characters."""
+    assert validate_git_ref("main") == "main"
+    assert validate_git_ref("origin/feat-123") == "origin/feat-123"
+    with pytest.raises(ValueError, match="Invalid or unsafe git ref"):
+        validate_git_ref("--upload-pack=evil")
+    with pytest.raises(ValueError, match="Invalid or unsafe git ref"):
+        validate_git_ref("-oProxyCommand=evil")
+    with pytest.raises(ValueError, match="Invalid or unsafe git ref"):
+        validate_git_ref("HEAD..origin/main")
+    with pytest.raises(ValueError, match="Invalid or unsafe git ref"):
+        validate_git_ref("main\n--flag")
+
+
+def test_cli_repo_mode_omits_comments_file_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running astraea-review --mode repo without --out-comments must not write comments JSON."""
+    monkeypatch.chdir(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def alpha(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+    out_md = tmp_path / "repo_summary.md"
+
+    rc = cli_main(["--mode", "repo", "--repo", str(repo), "--out-md", str(out_md)])
+    assert rc == 0
+    assert out_md.exists()
+    assert not (tmp_path / "pr_review_comments.json").exists()
+
+
+def test_generate_vertex_gemini_review_auth_modes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify generate_vertex_gemini_review configures genai.Client for all auth modes."""
+    from google import genai
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            return type("Resp", (), {"text": "  Reviewed OK  "})()
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+            self.models = _FakeModels()
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+    for var in ("VERTEX_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI"):
+        monkeypatch.delenv(var, raising=False)
+
+    report = PRReviewReport(base_ref="main", head_ref="feat")
+
+    # 1. Standard GEMINI_API_KEY mode
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key-1")
+    out1 = generate_vertex_gemini_review(report, diff_text="+x")
+    assert out1 == "Reviewed OK"
+    assert calls[-1]["api_key"] == "test-key-1"
+    assert "vertexai" not in calls[-1]
+
+    # 2. Vertex AI + API key mode
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
+    out2 = generate_vertex_gemini_review(report, diff_text="+x")
+    assert out2 == "Reviewed OK"
+    assert calls[-1]["api_key"] == "test-key-1"
+    assert calls[-1]["vertexai"] is True
+
+    # 3. GCP project + location mode
+    monkeypatch.delenv("GEMINI_API_KEY")
+    monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI")
+    out3 = generate_vertex_gemini_review(
+        report, diff_text="+x", project="my-proj", location="us-central1"
+    )
+    assert out3 == "Reviewed OK"
+    assert calls[-1]["vertexai"] is True
+    assert calls[-1]["project"] == "my-proj"
+    assert calls[-1]["location"] == "us-central1"
+
+    # 4. Missing credentials raises ValueError
+    with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+        generate_vertex_gemini_review(report, diff_text="+x")
+
+
+def test_cli_pr_mode_end_to_end(tmp_path: Path) -> None:
+    """Verify CLI --mode pr runs end-to-end against a 2-commit git repository."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = lambda *args: subprocess.run(  # noqa: E731
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git("init", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+
+    (repo / "calc.py").write_text(
+        "def scale(x: int) -> int:\n    return x * 2\n",
+        encoding="utf-8",
+    )
+    git("add", "calc.py")
+    git("commit", "-m", "initial")
+
+    (repo / "calc.py").write_text(
+        "def scale(x: int) -> int:\n    return x * 4\n",
+        encoding="utf-8",
+    )
+    git("commit", "-am", "update scale")
+
+    out_md = tmp_path / "pr_summary.md"
+    out_comments = tmp_path / "pr_comments.json"
+    rc = cli_main(
+        [
+            "--mode",
+            "pr",
+            "--repo",
+            str(repo),
+            "--base",
+            "HEAD~1",
+            "--head",
+            "HEAD",
+            "--out-md",
+            str(out_md),
+            "--out-comments",
+            str(out_comments),
+        ]
+    )
+    assert rc == 0
+    assert out_md.exists()
+    assert "scale" in out_md.read_text(encoding="utf-8")
+    assert out_comments.exists()

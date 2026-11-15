@@ -34,6 +34,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
       - name: Authenticate to Google Cloud (WIF, optional if GEMINI_API_KEY is set)
         if: ${{ vars.GCP_PROJECT_ID != '' && env.GCP_WIF_PROVIDER != '' }}
         uses: google-github-actions/auth@v2
@@ -57,12 +63,11 @@ jobs:
           GCP_LOCATION: ${{ vars.GCP_LOCATION || 'global' }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}
         run: |
-          extra_args=()
+          extra_args=(--gemini-model "$GEMINI_MODEL")
           if [ -n "$GCP_PROJECT_ID" ]; then
-            extra_args=(
+            extra_args+=(
               --vertex-project "$GCP_PROJECT_ID"
               --vertex-location "$GCP_LOCATION"
-              --gemini-model "$GEMINI_MODEL"
             )
           fi
           astraea-review \
@@ -97,7 +102,7 @@ jobs:
                   "-f", f"commit_id={os.environ.get('HEAD_COMMIT_SHA', '')}",
                   "-f", f"path={c['path']}",
                   "-F", f"line={c['line']}",
-                  "-f", "side=RIGHT",
+                  "-f", f"side={c.get('side', 'RIGHT')}",
               ], capture_output=True, text=True, check=False)
               if proc.returncode != 0:
                   failed += 1

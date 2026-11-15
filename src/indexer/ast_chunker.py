@@ -218,7 +218,9 @@ class ASTChunker:
                 symbol_node = node
 
             scope_parts = [*imports, *scope_stack]
-            docstring = self._extract_docstring(target_node, source_bytes, language)
+            docstring = self._extract_docstring(
+                target_node, source_bytes, language, symbol_node=symbol_node
+            )
             chunks.append(
                 self._build_chunk(
                     node=target_node,
@@ -317,18 +319,31 @@ class ASTChunker:
         )
 
     def _extract_symbol_name(self, node: Node, source_bytes: bytes) -> str:
+        if node.type == "impl_item":
+            type_node = node.child_by_field_name("type")
+            if type_node is not None:
+                return (
+                    self._slice(type_node, source_bytes).split("<", 1)[0].split("::")[-1].strip()
+                )
         name_node = node.child_by_field_name("name")
         if name_node is not None:
             return self._slice(name_node, source_bytes).strip()
+        decl_leaf_types = (
+            "identifier",
+            "field_identifier",
+            "qualified_identifier",
+            "destructor_name",
+            "operator_name",
+        )
         declarator = node.child_by_field_name("declarator")
         while declarator is not None:
-            if declarator.type in ("identifier", "field_identifier", "qualified_identifier"):
-                return self._slice(declarator, source_bytes).strip()
+            if declarator.type in decl_leaf_types:
+                return self._slice(declarator, source_bytes).split("::")[-1].strip()
             inner = declarator.child_by_field_name("declarator")
             if inner is None:
                 for child in declarator.children:
-                    if child.type in ("identifier", "field_identifier", "qualified_identifier"):
-                        return self._slice(child, source_bytes).strip()
+                    if child.type in decl_leaf_types:
+                        return self._slice(child, source_bytes).split("::")[-1].strip()
                 break
             declarator = inner
         for child in node.children:
@@ -336,7 +351,13 @@ class ASTChunker:
                 return self._slice(child, source_bytes).strip()
         return ""
 
-    def _extract_docstring(self, node: Node, source_bytes: bytes, language: Language) -> str:
+    def _extract_docstring(
+        self,
+        node: Node,
+        source_bytes: bytes,
+        language: Language,
+        symbol_node: Node | None = None,
+    ) -> str:
         comments: list[str] = []
         prev = node.prev_named_sibling
         while prev is not None and prev.type in ("comment", "line_comment", "block_comment"):
@@ -347,7 +368,7 @@ class ASTChunker:
             return "\n".join(comments)
 
         if language == Language.PYTHON:
-            body = node.child_by_field_name("body")
+            body = (symbol_node or node).child_by_field_name("body")
             if body is not None and body.named_child_count > 0:
                 first_stmt = body.named_children[0]
                 if first_stmt.type == "expression_statement" and first_stmt.named_child_count > 0:

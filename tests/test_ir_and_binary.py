@@ -11,10 +11,12 @@ from indexer.dwarf_aligner import DWARFAligner
 from indexer.llvm_ir_pass import (
     LLVMIRPass,
     canonicalize_ssa_instruction,
+    extract_leaf_symbol_name,
     resolve_clang_binary,
     sanitize_compile_flags,
 )
 from indexer.models import DWARFLineMapping
+from indexer.python_bytecode import lower_python_file
 
 
 def test_sec01_sanitize_compile_flags() -> None:
@@ -362,3 +364,126 @@ def test_rust_text_section_elf_lifting_and_indexing(tmp_path: Path) -> None:
         assert len(unit.binary_blocks) > 0
     finally:
         pipeline.store.close()
+
+
+@pytest.mark.skipif(resolve_clang_binary() is None, reason="clang-18/clang not installed in VM")
+def test_dwarf_v5_file_index_zero_and_header_isolation(tmp_path: Path) -> None:
+    """DWARF v5 0-based file table maps primary file (index 0) and isolates header lines."""
+    hdr = tmp_path / "inc.h"
+    hdr.write_text(
+        "static inline int hdr_fn(int x) {\n    return x + 42;\n}\n",
+        encoding="utf-8",
+    )
+    src = tmp_path / "main.c"
+    src.write_text(
+        '#include "inc.h"\n'
+        "int caller_fn(int a) {\n"
+        "    int y = a * 3;\n"
+        "    return hdr_fn(y);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    lifter = BinaryLifter()
+    obj_path = lifter.compile_to_object(src, tmp_path / "main.o", opt_level="-O0")
+    aligner = DWARFAligner()
+    mappings = aligner.extract_mappings(obj_path, default_file="FALLBACK")
+    assert any(Path(m.file_path).name == "main.c" for m in mappings)
+    assert any(Path(m.file_path).name == "inc.h" for m in mappings)
+    assert not any(m.file_path == "FALLBACK" for m in mappings)
+
+    main_only = aligner.lookup_va_for_line(mappings, 1, 5, file_path=str(src))
+    assert main_only
+    assert all(Path(m.file_path).name == "main.c" for m in main_only)
+
+
+def test_llvm_ir_define_dbg_decl_line_and_no_label_ssa_params() -> None:
+    """parse_ir_module captures decl_line from !dbg on define and excludes block labels."""
+    ir_text = """
+define dso_local i32 @branchy(i32 %x) !dbg !10 {
+entry:
+  %cmp = icmp sgt i32 %x, 0, !dbg !11
+  br i1 %cmp, label %if.then, label %if.else
+if.then:
+  %a = add i32 %x, 1
+  br label %merge
+if.else:
+  %b = sub i32 %x, 1
+  br label %merge
+merge:
+  %res = phi i32 [ %a, %if.then ], [ %b, %if.else ]
+  ret i32 %res
+}
+!10 = distinct !DISubprogram(name: "branchy", line: 17, type: !11, spFlags: DISPFlagDefinition)
+!11 = !DILocation(line: 18, column: 3, scope: !10)
+"""
+    graphs = LLVMIRPass().parse_ir_module(ir_text, source_file="branchy.c")
+    assert len(graphs) == 1
+    g = graphs[0]
+    assert g.decl_line == 17
+    param_nodes = [n for n in g.nodes if n.node_type == "val" and n.text == "<SSA_PARAM>"]
+    # Only %x is an SSA parameter; %if.then, %if.else, %merge must not become <SSA_PARAM>
+    assert len(param_nodes) == 1
+
+
+def test_rust_legacy_and_v0_demangling_and_private_fn_lowering(tmp_path: Path) -> None:
+    """extract_leaf_symbol_name handles legacy & v0 Rust symbols and private fn lowering."""
+    import shutil
+
+    assert extract_leaf_symbol_name("_ZN7mycrate7compute17h0123456789abcdefE") == "compute"
+    assert extract_leaf_symbol_name("_RNvCs91N3l2zy1RL_3lib11double_plus") == "double_plus"
+    assert extract_leaf_symbol_name("_RNvMs_Cs4fqI2P2rA04_3libNtB4_3Foo3bar") == "bar"
+
+    if shutil.which("rustc") is None:
+        return
+    rs_file = tmp_path / "priv.rs"
+    rs_file.write_text(
+        "fn private_helper(x: i32) -> i32 { x + 7 }\n"
+        "pub fn public_api(x: i32) -> i32 { private_helper(x) }\n",
+        encoding="utf-8",
+    )
+    ir_pass = LLVMIRPass()
+    ir_text = ir_pass.compile_rust_to_ir(rs_file)
+    graphs = ir_pass.parse_ir_module(ir_text, source_file=str(rs_file))
+    source_names = {g.source_name for g in graphs}
+    assert "private_helper" in source_names
+    assert "public_api" in source_names
+
+
+def test_arm64_instruction_normalization_and_cbz_branch_targets() -> None:
+    """ARM64 non-branch mnemonics starting with 'b' are not jumps; cbz normalizes target."""
+    assert normalize_instruction("bic", "x0, x1, #0x400", "aarch64") == (
+        "BIC REG64_ARG1, REG64_ARG2, <IMM_CONST>"
+    )
+    assert normalize_instruction("brk", "#0x1", "aarch64") == "BRK #0x1"
+    assert normalize_instruction("b.gt", "#0x1020", "aarch64") == "B.GT <BB_TARGET>"
+    assert normalize_instruction("cbz", "x0, #0x1008", "aarch64") == (
+        "CBZ REG64_ARG1, <BB_TARGET>"
+    )
+    # ARM64 machine code: cbz x0, #0x1008 (400000b4); mov w0, #1 (20008052); ret (c0035fd6)
+    arm64_bytes = bytes.fromhex("400000b420008052c0035fd6")
+    blocks = BinaryLifter().lift_bytes(
+        arm64_bytes, base_va=0x1000, function_name="check", arch="aarch64"
+    )
+    assert len(blocks) == 3
+    assert 0x1008 in blocks[0].successor_vas
+
+
+def test_python_bytecode_basic_block_splitting_and_successors(tmp_path: Path) -> None:
+    """Branching Python functions split into multiple basic blocks with successor_vas."""
+    py_file = tmp_path / "branch.py"
+    py_file.write_text(
+        "def first_fn(x: int) -> int:\n"
+        "    if x > 0:\n"
+        "        return x + 1\n"
+        "    return 0\n\n"
+        "def second_fn(y: int) -> int:\n"
+        "    if y < 0:\n"
+        "        raise ValueError('neg')\n"
+        "    return y\n",
+        encoding="utf-8",
+    )
+    ir_by_fn, blocks_by_fn = lower_python_file(py_file)
+    assert list(k for k in ir_by_fn if k) == ["first_fn", "second_fn"]
+    b_first = blocks_by_fn["first_fn"]
+    assert len(b_first) >= 2
+    assert any(len(b.successor_vas) >= 1 for b in b_first)

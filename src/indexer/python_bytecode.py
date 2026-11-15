@@ -9,6 +9,7 @@ from pathlib import Path
 from indexer.models import BinaryBasicBlock, LLVMIRGraph, ProGraMLEdge, ProGraMLNode
 
 _MAX_PY_BYTES = 2_000_000
+_PY_NO_FALLTHROUGH = ("RETURN_VALUE", "RETURN_CONST", "RAISE_VARARGS", "RERAISE")
 
 
 def _normalize_py_inst(inst: dis.Instruction) -> str:
@@ -58,7 +59,7 @@ def _build_code_cfg_and_blocks(
         )
 
     for idx, inst in enumerate(insns):
-        if idx + 1 < len(insns) and inst.opname not in ("RETURN_VALUE", "RETURN_CONST", "RERAISE"):
+        if idx + 1 < len(insns) and inst.opname not in _PY_NO_FALLTHROUGH:
             if not inst.opname.startswith("JUMP_"):
                 edges.append(ProGraMLEdge(source=idx, target=idx + 1, flow_type="ctrl"))
         if ("JUMP" in inst.opname or inst.opname == "FOR_ITER") and isinstance(inst.argval, int):
@@ -92,6 +93,7 @@ def _build_code_cfg_and_blocks(
                     va_end=curr_end,
                     raw_instructions=curr_raw,
                     normalized_instructions=curr_norm,
+                    successor_vas=[inst.offset],
                 )
             )
             curr_raw = []
@@ -103,6 +105,39 @@ def _build_code_cfg_and_blocks(
         curr_norm.append(_normalize_py_inst(inst))
         curr_end = inst.offset
 
+        is_branch_or_term = (
+            "JUMP" in inst.opname
+            or inst.opname == "FOR_ITER"
+            or inst.opname in _PY_NO_FALLTHROUGH
+        )
+        if is_branch_or_term:
+            succs: list[int] = []
+            if (
+                "JUMP" in inst.opname or inst.opname == "FOR_ITER"
+            ) and isinstance(inst.argval, int):
+                succs.append(inst.argval)
+            if (
+                inst.opname not in _PY_NO_FALLTHROUGH
+                and not inst.opname.startswith("JUMP_")
+                and idx + 1 < len(insns)
+            ):
+                succs.append(insns[idx + 1].offset)
+            blocks.append(
+                BinaryBasicBlock(
+                    function_name=code_obj.co_name,
+                    arch="python_bytecode",
+                    va_start=curr_start,
+                    va_end=curr_end,
+                    raw_instructions=curr_raw,
+                    normalized_instructions=curr_norm,
+                    successor_vas=succs,
+                )
+            )
+            curr_raw = []
+            curr_norm = []
+            if idx + 1 < len(insns):
+                curr_start = insns[idx + 1].offset
+
     if curr_raw:
         blocks.append(
             BinaryBasicBlock(
@@ -112,6 +147,7 @@ def _build_code_cfg_and_blocks(
                 va_end=curr_end,
                 raw_instructions=curr_raw,
                 normalized_instructions=curr_norm,
+                successor_vas=[],
             )
         )
 
@@ -143,7 +179,7 @@ def lower_python_file(
     stack: list[types.CodeType] = [root_code]
     while stack:
         code_obj = stack.pop()
-        for const in code_obj.co_consts:
+        for const in reversed(code_obj.co_consts):
             if isinstance(const, types.CodeType):
                 stack.append(const)
 

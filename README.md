@@ -87,9 +87,9 @@ astraea-index
 
 ## Incremental Indexing & Hybrid Storage
 
-- **Persistent Incremental State:** File hashes, unit mappings, and the CPG are persisted in SQLite (`file_state`, `units`, `snapshots`) and restored on `CodeIndexPipeline` startup.
+- **Persistent Incremental State:** File hashes, unit mappings, and indexed units are persisted in SQLite (`file_state`, `units`, `snapshots`), and the CPG is reconstructed from persisted `units` on `CodeIndexPipeline` startup.
 - **Compiler-Aware Cache Keys:** Per-file SHA-256 keys incorporate file contents, `compile_commands.json` flags, active compiler `--version`, and transitive local `#include "..."` header hashes for C/C++.
-- **Crash-Safe Storage Sync:** `HybridCodeStore.apply_batch` commits `units`, `snapshots`, `tombstones`, and `file_state` inside a single SQLite transaction before syncing Tantivy and Qdrant, protected by a re-entrant lock (`RLock`) for concurrent reads and writes.
+- **Crash-Safe Storage Sync:** `HybridCodeStore.apply_batch` records SQLite tombstones first, updates Tantivy and Qdrant, and then atomically commits `units`, `snapshots`, `file_state`, and tombstone cleanup in SQLite, protected by a re-entrant lock (`RLock`) for concurrent reads and writes.
 - **Ignored Directories:** Heavy build and dependency directories (`node_modules`, `build`, `dist`, `target`, `venv`, `.venv`, `__pycache__`, `vendor`, and dot-directories) are skipped automatically.
 
 ## Security & Resource Limits

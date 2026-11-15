@@ -36,6 +36,7 @@ class DWARFAligner:
                 line_prog = dwarf.line_program_for_CU(cu)
                 if line_prog is None:
                     continue
+                dwarf_ver = int(line_prog.header.get("version", 4))
                 file_entries = line_prog["file_entry"]
                 entries = line_prog.get_entries()
                 prev_state: Any = None
@@ -46,7 +47,10 @@ class DWARFAligner:
                         continue
                     if prev_state is not None and prev_state.address < state.address:
                         file_name = self._resolve_file_name(
-                            file_entries, prev_state.file, default_file
+                            file_entries,
+                            prev_state.file,
+                            default_file,
+                            dwarf_version=dwarf_ver,
                         )
                         line_no = int(prev_state.line)
                         col_no = int(prev_state.column)
@@ -129,11 +133,23 @@ class DWARFAligner:
         return info
 
     def lookup_va_for_line(
-        self, mappings: list[DWARFLineMapping], line_start: int, line_end: int | None = None
+        self,
+        mappings: list[DWARFLineMapping],
+        line_start: int,
+        line_end: int | None = None,
+        file_path: str | None = None,
     ) -> list[DWARFLineMapping]:
         """Return all DWARF mappings overlapping [line_start, line_end]."""
         end = line_start if line_end is None else line_end
-        return [m for m in mappings if m.line_end >= line_start and m.line_start <= end]
+        target_base = Path(file_path).name if file_path else ""
+        out: list[DWARFLineMapping] = []
+        for m in mappings:
+            if m.line_end < line_start or m.line_start > end:
+                continue
+            if target_base and m.file_path and Path(m.file_path).name != target_base:
+                continue
+            out.append(m)
+        return out
 
     def lookup_line_for_va(
         self, mappings: list[DWARFLineMapping], va: int
@@ -145,9 +161,15 @@ class DWARFAligner:
         return None
 
     @staticmethod
-    def _resolve_file_name(file_entries: list[Any], file_index: int, default_file: str) -> str:
-        if 1 <= file_index <= len(file_entries):
-            raw_name = file_entries[file_index - 1].name
+    def _resolve_file_name(
+        file_entries: list[Any],
+        file_index: int,
+        default_file: str,
+        dwarf_version: int = 4,
+    ) -> str:
+        idx = file_index if dwarf_version >= 5 else file_index - 1
+        if 0 <= idx < len(file_entries):
+            raw_name = file_entries[idx].name
             if isinstance(raw_name, bytes):
                 return raw_name.decode("utf-8", errors="replace")
             return str(raw_name)

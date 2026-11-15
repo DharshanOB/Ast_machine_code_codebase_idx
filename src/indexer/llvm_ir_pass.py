@@ -27,23 +27,30 @@ _SSA_REG_RE = re.compile(r"%([A-Za-z0-9_.$-]+)")
 _DBG_REF_RE = re.compile(r"!dbg\s+!(\d+)")
 _DBG_LOC_RE = re.compile(r"^!(\d+)\s*=\s*!DILocation\(line:\s*(\d+)")
 _DISUBPROGRAM_RE = re.compile(
-    r'^!(\d+)\s*=\s*(?:distinct\s+)?!DISubprogram\(([^)]+)\)'
+    r"^!(\d+)\s*=\s*(?:distinct\s+)?!DISubprogram\((.+)\)\s*$"
 )
 _DISUB_NAME_RE = re.compile(r'\bname:\s*"([^"]+)"')
 _DISUB_LINKAGE_RE = re.compile(r'\blinkageName:\s*"([^"]+)"')
-_DISUB_LINE_RE = re.compile(r'\bline:\s*(\d+)')
-_DEFINE_DBG_RE = re.compile(r'^define\b[^@]*@(?:"([^"]+)"|([A-Za-z0-9_.$-]+))\b.*?(!dbg\s+!(\d+))?')
+_DISUB_LINE_RE = re.compile(r"\bline:\s*(\d+)")
+_DEFINE_DBG_RE = re.compile(
+    r'^define\b[^@]*@(?:"([^"]+)"|([A-Za-z0-9_.$-]+)\b)(?:.*?\s(!dbg\s+!(\d+)))?'
+)
+_RUST_HASH_SUFFIX_RE = re.compile(r"::h[0-9a-fA-F]{16}$")
+_LHS_ASSIGN_RE = re.compile(r"^\s*(%[A-Za-z0-9_.$-]+)\s*=\s*(.*)$", re.DOTALL)
+_LABEL_OPERAND_RE = re.compile(r"\blabel\s+%([A-Za-z0-9_.$-]+)")
+_PHI_BLOCK_RE = re.compile(r",\s*%([A-Za-z0-9_.$-]+)\s*\]")
 _OPCODE_RE = re.compile(r"^(?:%[^\s=]+\s*=\s*)?([a-zA-Z0-9_.]+)")
 
 
 @functools.lru_cache(maxsize=2048)
 def extract_leaf_symbol_name(raw_name: str) -> str:
     """Best-effort demangle/strip C++ Itanium or Rust mangled symbol to leaf identifier."""
-    clean = raw_name.strip().lstrip("@")
+    clean = raw_name.strip().lstrip("@").strip('"')
     if not clean:
         return ""
     # Fast path for unmangled symbols
     if not clean.startswith(("_Z", "__Z", "_R")):
+        clean = _RUST_HASH_SUFFIX_RE.sub("", clean)
         return clean.split("::")[-1]
     cppfilt = shutil.which("c++filt")
     if cppfilt is not None and clean.startswith(("_Z", "__Z")):
@@ -59,15 +66,33 @@ def extract_leaf_symbol_name(raw_name: str) -> str:
             demangled = proc.stdout.strip()
             if proc.returncode == 0 and demangled and demangled != clean:
                 base = demangled.split("(", 1)[0].strip()
+                base = _RUST_HASH_SUFFIX_RE.sub("", base)
                 return base.split("::")[-1].split()[-1]
         except (OSError, subprocess.SubprocessError):
             pass
-    # Rust v0 mangling: _RNv...<len><ident>...
+    # Rust v0 mangling: _RNv...<len>_?<ident>...
     if clean.startswith("_R"):
-        segs = re.findall(r"(\d+)([A-Za-z_][A-Za-z0-9_]*)", clean)
-        for length_s, ident in reversed(segs):
-            if len(ident) >= int(length_s):
-                return str(ident[: int(length_s)])
+        pos = 2
+        idents: list[str] = []
+        num_re = re.compile(r"(\d+)")
+        while pos < len(clean):
+            m = num_re.match(clean, pos)
+            if not m:
+                pos += 1
+                continue
+            length = int(m.group(1))
+            end_num = m.end()
+            if end_num < len(clean) and clean[end_num] == "_":
+                end_num += 1
+            if length > 0 and end_num + length <= len(clean):
+                cand = clean[end_num : end_num + length]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cand):
+                    idents.append(cand)
+                    pos = end_num + length
+                    continue
+            pos = end_num + 1
+        if idents:
+            return idents[-1]
     return clean
 
 
@@ -190,6 +215,8 @@ class LLVMIRPass:
                 "debuginfo=1",
                 "-C",
                 "opt-level=1",
+                "-C",
+                "link-dead-code",
                 str(src),
                 "-o",
                 str(out_ll),
@@ -213,19 +240,27 @@ class LLVMIRPass:
 
     def parse_ir_module(self, ir_text: str, source_file: str = "<memory>") -> list[LLVMIRGraph]:
         """Parse LLVM IR assembly text into per-function ProGraML LLVMIRGraph models."""
-        mod = llvm.parse_assembly(ir_text)
-        mod_text = str(mod)
-        dbg_lines = self._extract_dbg_locations(mod_text)
-        subprogram_meta = self._extract_subprogram_metadata(mod_text)
-        graphs: list[LLVMIRGraph] = []
+        ctx = llvm.create_context()
+        try:
+            mod = llvm.parse_assembly(ir_text, context=ctx)
+            try:
+                mod_text = str(mod)
+                combined_text = f"{ir_text}\n{mod_text}"
+                dbg_lines = self._extract_dbg_locations(combined_text)
+                subprogram_meta = self._extract_subprogram_metadata(combined_text)
+                graphs: list[LLVMIRGraph] = []
 
-        for func in mod.functions:
-            if func.is_declaration:
-                continue
-            graphs.append(
-                self._build_function_graph(func, source_file, dbg_lines, subprogram_meta)
-            )
-        return graphs
+                for func in mod.functions:
+                    if func.is_declaration:
+                        continue
+                    graphs.append(
+                        self._build_function_graph(func, source_file, dbg_lines, subprogram_meta)
+                    )
+                return graphs
+            finally:
+                mod.close()
+        finally:
+            ctx.close()
 
     def _build_function_graph(
         self,
@@ -247,8 +282,10 @@ class LLVMIRPass:
         # Pass 1: register instruction nodes, intra-block ctrl edges, and all SSA definitions
         # so loop-carried phi back-edges resolve to defining instructions rather than params.
         blocks = list(func.blocks)
-        for bb in blocks:
-            bb_name = bb.name or f"bb_{len(block_entry_node)}"
+        bb_names: list[str] = []
+        for idx, bb in enumerate(blocks):
+            bb_name = bb.name or f"bb_{idx}"
+            bb_names.append(bb_name)
             prev_inst_id: int | None = None
             for inst in bb.instructions:
                 if len(nodes) >= MAX_GRAPH_NODES:
@@ -286,11 +323,10 @@ class LLVMIRPass:
                     )
                 prev_inst_id = nid
 
-                if "=" in raw_inst:
-                    lhs, rhs = raw_inst.split("=", 1)
-                    lhs_clean = lhs.strip()
-                    if lhs_clean.startswith("%"):
-                        reg_def_node[lhs_clean] = nid
+                assign_m = _LHS_ASSIGN_RE.match(raw_inst)
+                if assign_m:
+                    reg_def_node[assign_m.group(1)] = nid
+                    rhs = assign_m.group(2)
                 else:
                     rhs = raw_inst
                 inst_rhs_list.append((nid, rhs))
@@ -301,10 +337,21 @@ class LLVMIRPass:
             if truncated:
                 break
 
+        non_value_regs: set[str] = {f"%{b}" for b in block_entry_node}
+        for _, rhs in inst_rhs_list:
+            for lm in _LABEL_OPERAND_RE.finditer(rhs):
+                non_value_regs.add(f"%{lm.group(1)}")
+            for pm in _PHI_BLOCK_RE.finditer(rhs):
+                non_value_regs.add(f"%{pm.group(1)}")
+
         # Pass 2: link SSA data-dependency edges using the complete per-function def map.
         for nid, rhs in inst_rhs_list:
             for pos, op_match in enumerate(_SSA_REG_RE.finditer(rhs)):
                 op_reg = f"%{op_match.group(1)}"
+                if op_reg in non_value_regs or op_reg.startswith(
+                    ("%struct.", "%class.", "%union.")
+                ):
+                    continue
                 if op_reg in reg_def_node and reg_def_node[op_reg] != nid:
                     edges.append(
                         ProGraMLEdge(
@@ -330,15 +377,16 @@ class LLVMIRPass:
                     )
 
         # Link inter-block control-flow edges (including phi/loop back-edges).
-        for bb in blocks:
-            bb_name = bb.name
+        for bb, bb_name in zip(blocks, bb_names, strict=True):
             exit_id = block_exit_node.get(bb_name)
             if exit_id is None:
                 continue
             bb_text = str(bb)
-            for pos, label_match in enumerate(re.finditer(r"label\s+%([A-Za-z0-9_.$-]+)", bb_text)):
+            for pos, label_match in enumerate(_LABEL_OPERAND_RE.finditer(bb_text)):
                 target_bb = label_match.group(1)
-                entry_id = block_entry_node.get(target_bb)
+                entry_id = block_entry_node.get(target_bb) or block_entry_node.get(
+                    f"bb_{target_bb}"
+                )
                 if entry_id is not None:
                     edges.append(
                         ProGraMLEdge(
