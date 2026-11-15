@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="260" viewBox="0 0 1200 260" role="img" aria-label="Astraea — 4-Layer Code Indexer and Reviewer">
+  <rect width="1200" height="260" rx="10" fill="#0A0A0C" />
+  <rect x="0.5" y="0.5" width="1199" height="259" rx="9.5" fill="none" stroke="#1E1E24" />
+
+  <!-- Minimal geometric 4-layer graph mark -->
+  <g transform="translate(88, 86)" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 16 L44 16 L76 44 L44 72 L12 72" stroke="#3F3F46" stroke-width="1.5" />
+    <path d="M12 44 L76 44" stroke="#52525B" stroke-width="1.5" />
+    <circle cx="12" cy="16" r="3.5" fill="#E4E4E7" />
+    <circle cx="12" cy="44" r="3.5" fill="#A1A1AA" />
+    <circle cx="12" cy="72" r="3.5" fill="#71717A" />
+    <circle cx="44" cy="16" r="3.5" fill="#A1A1AA" />
+    <circle cx="44" cy="44" r="4" fill="#60A5FA" />
+    <circle cx="44" cy="72" r="3.5" fill="#71717A" />
+    <circle cx="76" cy="44" r="4" fill="#F4F4F5" />
+  </g>
+
+  <!-- Wordmark and subtitle -->
+  <text x="208" y="128" fill="#F4F4F5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, Helvetica, Arial, sans-serif" font-size="44" font-weight="600" letter-spacing="10">ASTRAEA</text>
+  <text x="210" y="164" fill="#8E8E98" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="15" letter-spacing="0.8">4-LAYER CODE INDEXER  ·  AST  ·  CPG  ·  LLVM IR  ·  MACHINE CODE</text>
+</svg>
