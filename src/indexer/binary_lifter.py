@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import subprocess
 import tempfile
+from itertools import islice
 from pathlib import Path
 
 import capstone
@@ -124,6 +125,10 @@ def normalize_instruction(mnemonic: str, op_str: str, arch: str = "x86_64") -> s
     return f"{mn} {norm_ops}"
 
 
+MAX_DISASM_BYTES: int = 1_048_576  # 1 MiB cap per function
+MAX_DISASM_INSNS: int = 50_000
+
+
 class BinaryLifter:
     """Compiles or opens ELF binaries, disassembles functions, and extracts normalized BB-CFGs."""
 
@@ -237,7 +242,7 @@ class BinaryLifter:
         )
         try:
             md = capstone.Cs(cs_arch, cs_mode)
-            insns = list(md.disasm(code, base_va))
+            insns = list(islice(md.disasm(code[:MAX_DISASM_BYTES], base_va), MAX_DISASM_INSNS))
         except Exception:
             return []
 

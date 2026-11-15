@@ -10,12 +10,32 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from indexer.models import CPGEdgeKind, IRStatus, UnifiedCodeUnit
+from indexer.models import ASTChunkNode, CPGEdgeKind, IRStatus, UnifiedCodeUnit
 from mcp_server.code_index_server import CodeIndexPipeline
 from storage.hybrid_store import compute_wl_ir_vector, cosine_similarity
 
 _DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_CONTAINER_NODE_TYPES: frozenset[str] = frozenset(
+    {
+        "class_definition",
+        "class_specifier",
+        "struct_specifier",
+        "impl_item",
+        "struct_item",
+        "trait_item",
+        "enum_specifier",
+    }
+)
+
+
+def _is_nested_chunk(a: ASTChunkNode, b: ASTChunkNode) -> bool:
+    """Return True if chunk `a` and `b` are in the same file and one encloses the other."""
+    if a.file_path != b.file_path:
+        return False
+    a_in_b = b.line_start <= a.line_start and a.line_end <= b.line_end
+    b_in_a = a.line_start <= b.line_start and b.line_end <= a.line_end
+    return a_in_b or b_in_a
 
 
 class ReviewFinding(BaseModel):
@@ -464,6 +484,7 @@ def analyze_repository(
         ast = unit.ast_chunk
         rel = _rel_path(ast.file_path, root)
         sym_name = ast.symbol_name or "<anonymous>"
+        is_container = ast.node_kind in _CONTAINER_NODE_TYPES
         callers = 0
         if unit.scip_symbol is not None:
             slices = pipe.cpg.k_hop_slice(
@@ -474,7 +495,7 @@ def analyze_repository(
             )
             callers = len({str(s["source"]) for s in slices})
 
-        if ast.cyclomatic_complexity >= complexity_threshold or callers >= 3:
+        if not is_container and (ast.cyclomatic_complexity >= complexity_threshold or callers >= 3):
             hotspots.append(
                 {
                     "symbol_name": sym_name,
@@ -483,7 +504,7 @@ def analyze_repository(
                     "callers": callers,
                 }
             )
-        if ast.cyclomatic_complexity >= complexity_threshold:
+        if not is_container and ast.cyclomatic_complexity >= complexity_threshold:
             findings.append(
                 ReviewFinding(
                     severity="MEDIUM",
@@ -511,7 +532,7 @@ def analyze_repository(
             unit.unit_id, modality=modality, threshold=clone_threshold, top_k=2
         ):
             other = pipe.store.units.get(cid)
-            if other is None:
+            if other is None or _is_nested_chunk(ast, other.ast_chunk):
                 continue
             other_name = other.ast_chunk.symbol_name or "<anonymous>"
             if other_name == sym_name:
