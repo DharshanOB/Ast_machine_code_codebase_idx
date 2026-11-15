@@ -124,3 +124,27 @@ def test_periodic_repository_audit(tmp_path: Path) -> None:
     md = repo_report.to_markdown()
     assert "Periodic 4-Layer Repository Review" in md
     assert "Semantic / IR Clone Pairs" in md
+
+
+def test_python_bytecode_and_javascript_indexing(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text(
+        "def compute(x: int) -> int:\n"
+        "    if x > 0:\n"
+        "        return x * 2\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "helper.js").write_text(
+        "class Helper {\n"
+        "  greet(name) {\n"
+        "    return name ? `hi ${name}` : 'hi';\n"
+        "  }\n"
+        "}\n"
+        "function add(a, b) {\n"
+        "  return a + b;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    repo_report = analyze_repository(tmp_path)
+    assert repo_report.indexed_units >= 4
+    assert repo_report.degraded_units == 0

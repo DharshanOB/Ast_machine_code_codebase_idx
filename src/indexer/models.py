@@ -17,6 +17,7 @@ class Language(StrEnum):
     CPP = "cpp"
     RUST = "rust"
     PYTHON = "python"
+    JAVASCRIPT = "javascript"
 
 
 class IRStatus(StrEnum):
@@ -25,6 +26,7 @@ class IRStatus(StrEnum):
     OK = "OK"
     DEGRADED = "DEGRADED"
     SKIPPED = "SKIPPED"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
 
 
 class CPGEdgeKind(StrEnum):

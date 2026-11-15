@@ -91,6 +91,7 @@ class LLVMIRPass:
 
     def __init__(self, clang_bin: str = "clang-18") -> None:
         self.clang_bin = resolve_clang_binary(clang_bin)
+        self.rustc_bin = shutil.which("rustc")
         BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
     def compile_to_ir(
@@ -133,6 +134,38 @@ class LLVMIRPass:
             )
             if proc.returncode != 0 or not out_ll.exists():
                 raise RuntimeError(f"Clang IR emission failed: {proc.stderr.strip()}")
+            return out_ll.read_text(encoding="utf-8", errors="replace")
+
+    def compile_rust_to_ir(self, source_path: str | Path) -> str:
+        """Compile a standalone Rust file to LLVM IR text via rustc."""
+        if self.rustc_bin is None:
+            raise RuntimeError("No rustc compiler binary found on PATH")
+        src = Path(source_path)
+        with tempfile.TemporaryDirectory(dir=BUILD_TMP_ROOT) as tmp_dir:
+            out_ll = Path(tmp_dir) / f"{src.stem}.ll"
+            cmd = [
+                self.rustc_bin,
+                "--crate-type",
+                "lib",
+                "--emit=llvm-ir",
+                "-C",
+                "debuginfo=1",
+                "-C",
+                "opt-level=1",
+                str(src),
+                "-o",
+                str(out_ll),
+            ]
+            proc = subprocess.run(
+                cmd,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=MAX_COMPILER_TIMEOUT_S,
+                preexec_fn=_apply_resource_limits if os.name == "posix" else None,
+            )
+            if proc.returncode != 0 or not out_ll.exists():
+                raise RuntimeError(f"Rustc IR emission failed: {proc.stderr.strip()}")
             return out_ll.read_text(encoding="utf-8", errors="replace")
 
     def parse_ir_module(self, ir_text: str, source_file: str = "<memory>") -> list[LLVMIRGraph]:

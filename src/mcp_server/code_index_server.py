@@ -21,6 +21,7 @@ from indexer.models import (
     LLVMIRGraph,
     UnifiedCodeUnit,
 )
+from indexer.python_bytecode import lower_python_file
 from indexer.semantic_cpg import SemanticCPGBuilder
 from storage.hybrid_store import HybridCodeStore
 
@@ -109,16 +110,30 @@ class CodeIndexPipeline:
                     self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
                 except Exception:
                     pass
+            elif lang == Language.RUST and self.ir_pass.rustc_bin is not None:
+                try:
+                    ir_text = self.ir_pass.compile_rust_to_ir(src_path)
+                    for g in self.ir_pass.parse_ir_module(ir_text, source_file=str(src_path)):
+                        ir_by_fn[g.function_name] = g
+                    obj_path = self.lifter.compile_rust_to_object(src_path)
+                    bin_by_fn = self.lifter.lift_elf(obj_path)
+                    dwarf_maps = self.dwarf.extract_mappings(obj_path, default_file=str(src_path))
+                    self.dwarf.attach_ir_dbg_ids(dwarf_maps, list(ir_by_fn.values()))
+                except Exception:
+                    pass
+            elif lang == Language.PYTHON:
+                ir_by_fn, bin_by_fn = lower_python_file(src_path)
 
             for chunk in chunks:
                 sym = chunk_to_symbol.get(chunk.chunk_id)
                 ir_graph = ir_by_fn.get(chunk.symbol_name)
                 bin_blocks = bin_by_fn.get(chunk.symbol_name, [])
-                status = (
-                    IRStatus.OK
-                    if (ir_graph is not None or bin_blocks)
-                    else IRStatus.DEGRADED
-                )
+                if ir_graph is not None or bin_blocks:
+                    status = IRStatus.OK
+                elif lang == Language.JAVASCRIPT:
+                    status = IRStatus.NOT_APPLICABLE
+                else:
+                    status = IRStatus.DEGRADED
                 if status == IRStatus.DEGRADED:
                     degraded_count += 1
                 unit_mappings = self.dwarf.lookup_va_for_line(

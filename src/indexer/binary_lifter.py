@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 import tempfile
 from itertools import islice
@@ -134,6 +135,7 @@ class BinaryLifter:
 
     def __init__(self, clang_bin: str = "clang-18") -> None:
         self.clang_bin = resolve_clang_binary(clang_bin)
+        self.rustc_bin = shutil.which("rustc")
         BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
     def compile_to_object(
@@ -177,6 +179,44 @@ class BinaryLifter:
         )
         if proc.returncode != 0 or not target_path.exists():
             raise RuntimeError(f"Object compilation failed: {proc.stderr.strip()}")
+        return target_path
+
+    def compile_rust_to_object(
+        self,
+        source_path: str | Path,
+        out_obj_path: str | Path | None = None,
+    ) -> Path:
+        """Compile a standalone Rust file to an ELF object file with DWARF info."""
+        if self.rustc_bin is None:
+            raise RuntimeError("No rustc compiler binary found on PATH")
+        src = Path(source_path)
+        target_path = (
+            Path(out_obj_path)
+            if out_obj_path is not None
+            else Path(tempfile.mkdtemp(dir=BUILD_TMP_ROOT)) / f"{src.stem}.o"
+        )
+        cmd = [
+            self.rustc_bin,
+            "--crate-type",
+            "lib",
+            "--emit=obj",
+            "-C",
+            "debuginfo=2",
+            "-C",
+            "opt-level=1",
+            str(src),
+            "-o",
+            str(target_path),
+        ]
+        proc = subprocess.run(
+            cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=MAX_COMPILER_TIMEOUT_S,
+        )
+        if proc.returncode != 0 or not target_path.exists():
+            raise RuntimeError(f"Rustc object compilation failed: {proc.stderr.strip()}")
         return target_path
 
     def lift_elf(

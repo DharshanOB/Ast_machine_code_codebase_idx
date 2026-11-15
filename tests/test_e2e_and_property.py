@@ -32,11 +32,15 @@ def test_e2e01_pipeline_indexing_and_degraded_fallback(tmp_path: Path) -> None:
         "def helper_fn(n: int) -> int:\n    return n + 1\n",
         encoding="utf-8",
     )
+    (tmp_path / "broken.c").write_text(
+        "int broken_fn(int x) { return unknown_symbol_xyz; }\n",
+        encoding="utf-8",
+    )
 
     pipeline = CodeIndexPipeline(storage_dir=tmp_path / ".idx")
     summary = pipeline.index_workspace(tmp_path)
-    assert summary["indexed_units"] == 2
-    assert summary["symbols_count"] >= 2
+    assert summary["indexed_units"] == 3
+    assert summary["symbols_count"] >= 3
 
     hits = pipeline.store.rrf_search("scale_pos", top_k=5)
     assert any(h.symbol_name == "scale_pos" for h in hits)
@@ -47,9 +51,13 @@ def test_e2e01_pipeline_indexing_and_degraded_fallback(tmp_path: Path) -> None:
     assert inspected["ir_status"] in (IRStatus.OK.value, IRStatus.DEGRADED.value)
     assert len(json.dumps(inspected)) <= 2048 * 4
 
-    # Python file gracefully degrades to Layer 1 + Layer 2 without aborting batch
+    # Python file lowers to bytecode CFG + basic blocks
     py_inspected = pipeline.inspect_lowering_pipeline("helper_fn")
-    assert py_inspected["ir_status"] == IRStatus.DEGRADED.value
+    assert py_inspected["ir_status"] == IRStatus.OK.value
+
+    # Broken C file gracefully degrades to Layer 1 + Layer 2 without aborting batch
+    broken_inspected = pipeline.inspect_lowering_pipeline("broken_fn")
+    assert broken_inspected["ir_status"] == IRStatus.DEGRADED.value
 
 
 def test_mcp_tools_registered() -> None:

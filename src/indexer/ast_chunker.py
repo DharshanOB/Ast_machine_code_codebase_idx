@@ -7,6 +7,7 @@ from pathlib import Path
 
 import tree_sitter_c
 import tree_sitter_cpp
+import tree_sitter_javascript
 import tree_sitter_python
 import tree_sitter_rust
 from tree_sitter import Language as TSLanguage
@@ -24,6 +25,10 @@ _EXTENSION_MAP: dict[str, Language] = {
     ".hh": Language.CPP,
     ".rs": Language.RUST,
     ".py": Language.PYTHON,
+    ".js": Language.JAVASCRIPT,
+    ".mjs": Language.JAVASCRIPT,
+    ".cjs": Language.JAVASCRIPT,
+    ".jsx": Language.JAVASCRIPT,
 }
 
 _CHUNK_NODE_TYPES: dict[Language, frozenset[str]] = {
@@ -33,6 +38,14 @@ _CHUNK_NODE_TYPES: dict[Language, frozenset[str]] = {
     ),
     Language.RUST: frozenset({"function_item", "impl_item", "struct_item", "trait_item"}),
     Language.PYTHON: frozenset({"function_definition", "class_definition", "decorated_definition"}),
+    Language.JAVASCRIPT: frozenset(
+        {
+            "function_declaration",
+            "generator_function_declaration",
+            "class_declaration",
+            "method_definition",
+        }
+    ),
 }
 
 _SCOPE_NODE_TYPES: frozenset[str] = frozenset(
@@ -43,6 +56,7 @@ _SCOPE_NODE_TYPES: frozenset[str] = frozenset(
         "impl_item",
         "mod_item",
         "class_definition",
+        "class_declaration",
     }
 )
 
@@ -66,9 +80,12 @@ _BRANCH_NODE_TYPES: frozenset[str] = frozenset(
         "while_expression",
         "do_statement",
         "case_statement",
+        "switch_case",
         "conditional_expression",
+        "ternary_expression",
         "match_arm",
         "except_clause",
+        "catch_clause",
         "boolean_operator",
     }
 )
@@ -107,6 +124,7 @@ class ASTChunker:
             Language.CPP: TSLanguage(tree_sitter_cpp.language()),
             Language.RUST: TSLanguage(tree_sitter_rust.language()),
             Language.PYTHON: TSLanguage(tree_sitter_python.language()),
+            Language.JAVASCRIPT: TSLanguage(tree_sitter_javascript.language()),
         }
         self._parsers: dict[Language, Parser] = {
             lang: Parser(ts_lang) for lang, ts_lang in self._languages.items()
@@ -298,7 +316,7 @@ class ASTChunker:
                 break
             declarator = inner
         for child in node.children:
-            if child.type in ("type_identifier", "identifier"):
+            if child.type in ("type_identifier", "identifier", "property_identifier"):
                 return self._slice(child, source_bytes).strip()
         return ""
 
