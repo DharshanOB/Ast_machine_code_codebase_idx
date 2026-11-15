@@ -40,6 +40,56 @@ def _is_nested_chunk(a: ASTChunkNode, b: ASTChunkNode) -> bool:
     return a_in_b or b_in_a
 
 
+def _collect_connected_sources(
+    pipe: CodeIndexPipeline,
+    unit: UnifiedCodeUnit,
+    root: Path,
+    max_neighbors: int = 4,
+    max_chars: int = 1200,
+) -> list[dict[str, Any]]:
+    """Collect 1-hop caller and callee source snippets for a code unit within a char budget."""
+    if unit.scip_symbol is None:
+        return []
+    self_uri = unit.scip_symbol.symbol_uri
+    slices = pipe.cpg.k_hop_slice(
+        self_uri,
+        max_hops=1,
+        edge_kinds=frozenset({CPGEdgeKind.CALLS}),
+        direction="both",
+    )
+    connected: list[dict[str, Any]] = []
+    seen_uids: set[str] = {unit.unit_id}
+    for edge in slices:
+        src_uri = str(edge["source"])
+        dst_uri = str(edge["target"])
+        if src_uri == self_uri and dst_uri != self_uri:
+            neighbor_uri, relation = dst_uri, "callee"
+        elif dst_uri == self_uri and src_uri != self_uri:
+            neighbor_uri, relation = src_uri, "caller"
+        else:
+            continue
+        uid = pipe.symbol_to_unit.get(neighbor_uri)
+        if not uid or uid in seen_uids:
+            continue
+        neighbor = pipe.store.units.get(uid)
+        if neighbor is None or neighbor.ast_chunk.node_kind in _CONTAINER_NODE_TYPES:
+            continue
+        seen_uids.add(uid)
+        n_ast = neighbor.ast_chunk
+        connected.append(
+            {
+                "relation": relation,
+                "symbol_name": n_ast.symbol_name or "<anonymous>",
+                "file_path": _rel_path(n_ast.file_path, root),
+                "line_start": n_ast.line_start,
+                "source_text": n_ast.source_text[:max_chars],
+            }
+        )
+        if len(connected) >= max_neighbors:
+            break
+    return connected
+
+
 class ReviewFinding(BaseModel):
     """Actionable PR finding anchored to a file and line."""
 
@@ -76,6 +126,7 @@ class PRReviewReport(BaseModel):
     base_ref: str = "base"
     head_ref: str = "head"
     changed_functions: list[FunctionDelta] = Field(default_factory=list)
+    connected_sources: list[dict[str, Any]] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
 
     def to_markdown(self) -> str:
@@ -324,6 +375,8 @@ def analyze_pr_directories(
 
     deltas: list[FunctionDelta] = []
     findings: list[ReviewFinding] = []
+    pr_connected: list[dict[str, Any]] = []
+    seen_pr_conn: set[tuple[str, str]] = set()
 
     for (rel_file, sym_name), head_unit in sorted(head_units.items()):
         hunks = changed_hunks.get(rel_file)
@@ -460,10 +513,20 @@ def analyze_pr_directories(
                 )
             )
 
+        if len(pr_connected) < 8:
+            for conn in _collect_connected_sources(head_pipe, head_unit, head_dir, max_neighbors=3):
+                key = (str(conn["file_path"]), str(conn["symbol_name"]))
+                if key not in seen_pr_conn:
+                    seen_pr_conn.add(key)
+                    pr_connected.append(conn)
+                    if len(pr_connected) >= 8:
+                        break
+
     return PRReviewReport(
         base_ref=base_ref,
         head_ref=head_ref,
         changed_functions=deltas,
+        connected_sources=pr_connected[:8],
         findings=findings,
     )
 
@@ -655,6 +718,7 @@ def analyze_repository(
         if not is_container and (ast.cyclomatic_complexity >= complexity_threshold or callers >= 3):
             hotspot_candidates.append(
                 {
+                    "unit": unit,
                     "symbol_name": sym_name,
                     "file_path": rel,
                     "line_start": ast.line_start,
@@ -762,6 +826,9 @@ def analyze_repository(
             "complexity": h["complexity"],
             "callers": h["callers"],
             "source_text": str(h["source_text"])[:4000],
+            "connected_sources": _collect_connected_sources(
+                pipe, h["unit"], root, max_neighbors=3, max_chars=1200
+            ),
         }
         for h in hotspot_candidates[:5]
     ]

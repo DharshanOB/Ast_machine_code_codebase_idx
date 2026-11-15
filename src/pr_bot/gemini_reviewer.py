@@ -43,12 +43,31 @@ def build_review_prompt(
     if hotspot_sources:
         src_blocks = ["### Top Hotspot Source Code"]
         for hs in hotspot_sources[:5]:
-            src_blocks.append(
+            block = (
                 f"#### `{hs['symbol_name']}` (`{hs['file_path']}:{hs['line_start']}`, "
                 f"CC={hs['complexity']}, callers={hs['callers']})\n"
                 f"```\n{hs['source_text']}\n```"
             )
+            conns = hs.get("connected_sources") or []
+            if conns:
+                conn_lines = [
+                    f"- **{c['relation']}** `{c['symbol_name']}` "
+                    f"(`{c['file_path']}:{c['line_start']}`):\n```\n{c['source_text']}\n```"
+                    for c in conns[:3]
+                ]
+                block = f"{block}\n\n**Connected Callers/Callees:**\n" + "\n".join(conn_lines)
+            src_blocks.append(block)
         sections.append("\n\n".join(src_blocks))
+
+    pr_connected = getattr(report, "connected_sources", [])
+    if pr_connected:
+        conn_blocks = ["### Connected Callers & Callees (1-Hop CPG Context)"]
+        for c in pr_connected[:8]:
+            conn_blocks.append(
+                f"- **{c['relation']}** `{c['symbol_name']}` "
+                f"(`{c['file_path']}:{c['line_start']}`):\n```\n{c['source_text']}\n```"
+            )
+        sections.append("\n\n".join(conn_blocks))
 
     if diff_text.strip():
         truncated_diff = (
