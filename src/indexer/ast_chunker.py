@@ -110,6 +110,15 @@ def split_identifier_tokens(text: str) -> list[str]:
     return tokens
 
 
+_HEADER_EXTENSIONS: frozenset[str] = frozenset({".h", ".hpp", ".hh"})
+MAX_FILE_BYTES: int = 2_000_000
+
+
+def is_header_file(file_path: str | Path) -> bool:
+    """Return True if file_path is a C/C++ header rather than a compilation unit."""
+    return Path(file_path).suffix.lower() in _HEADER_EXTENSIONS
+
+
 def detect_language(file_path: str | Path) -> Language | None:
     """Infer supported Language from a file extension."""
     return _EXTENSION_MAP.get(Path(file_path).suffix.lower())
@@ -136,11 +145,18 @@ class ASTChunker:
         lang = detect_language(path_str)
         if lang is None:
             return []
-        text = (
-            Path(path_str).read_text(encoding="utf-8", errors="replace")
-            if source is None
-            else source
-        )
+        if source is None:
+            path = Path(path_str)
+            try:
+                if path.stat().st_size > MAX_FILE_BYTES:
+                    return []
+            except OSError:
+                return []
+            text = path.read_text(encoding="utf-8", errors="replace")
+        else:
+            if len(source.encode("utf-8", errors="ignore")) > MAX_FILE_BYTES:
+                return []
+            text = source
         return self.chunk_source(text, lang, file_path=path_str)
 
     def chunk_source(

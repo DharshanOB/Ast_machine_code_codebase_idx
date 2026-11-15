@@ -17,6 +17,7 @@ import tree_sitter_rust
 from tree_sitter import Language as TSLanguage
 from tree_sitter import Node, Parser
 
+from indexer.llvm_ir_pass import extract_leaf_symbol_name
 from indexer.models import (
     ASTChunkNode,
     CPGEdgeKind,
@@ -41,7 +42,8 @@ _COMMENT_OR_STRING_TYPES: frozenset[str] = frozenset(
         "template_string",
     }
 )
-_ASSIGN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
+_ASSIGN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\n]+)?=(?!=)")
+_MAX_CFG_LINES_PER_CHUNK = 500
 _INHERIT_RE = re.compile(
     r"(?:class|struct)\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\(([^)]+)\)|:\s*(?:public|private|protected)?\s*([A-Za-z_][A-Za-z0-9_:]*))"
 )
@@ -140,7 +142,8 @@ class SemanticCPGBuilder:
 
         for chunk in chunks:
             name = chunk.symbol_name or f"anon_{chunk.chunk_id[:8]}"
-            desc = f"{Path(chunk.file_path).name}/{name}#{chunk.line_start}"
+            norm_path = chunk.file_path.replace("\\", "/").lstrip("/") or "<memory>"
+            desc = f"{norm_path}/{name}#{chunk.line_start}"
             uri = make_symbol_uri(self.package_name, self.version, desc)
             node = SCIPSymbolNode(
                 symbol_uri=uri,
@@ -435,7 +438,8 @@ class SemanticCPGBuilder:
         last_def_node: dict[str, str] = {}
         prev_line_node: str | None = None
         sanitized_source = self._strip_comments_and_strings(chunk)
-        for offset, line_text in enumerate(sanitized_source.splitlines()):
+        lines = sanitized_source.splitlines()[:_MAX_CFG_LINES_PER_CHUNK]
+        for offset, line_text in enumerate(lines):
             stripped = line_text.strip()
             if not stripped:
                 continue
@@ -467,13 +471,23 @@ class SemanticCPGBuilder:
         ir_call_re = re.compile(r"\bcall\b[^@]*@([A-Za-z0-9_$.]+)\s*\(")
         ir_calls: set[tuple[str, str]] = set()
         for graph in ir_graphs:
-            caller = graph.function_name
+            caller_candidates = {graph.function_name}
+            if graph.source_name:
+                caller_candidates.add(graph.source_name)
+            leaf_caller = extract_leaf_symbol_name(graph.function_name)
+            if leaf_caller:
+                caller_candidates.add(leaf_caller)
             for node in graph.nodes:
                 if node.opcode == "call":
                     for match in ir_call_re.finditer(node.text):
-                        callee = match.group(1).split(".")[0]
+                        raw_callee = match.group(1)
+                        callee = raw_callee.split(".")[0]
                         if callee and not callee.startswith("llvm"):
-                            ir_calls.add((caller, callee))
+                            callee_leaf = extract_leaf_symbol_name(raw_callee)
+                            for c_caller in caller_candidates:
+                                ir_calls.add((c_caller, callee))
+                                if callee_leaf:
+                                    ir_calls.add((c_caller, callee_leaf))
 
         cpg_calls: set[tuple[str, str]] = set()
         ambiguous_calls: set[tuple[str, str]] = set()

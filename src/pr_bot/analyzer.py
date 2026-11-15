@@ -19,6 +19,7 @@ from storage.hybrid_store import compute_wl_ir_vector, cosine_similarity
 
 logger = logging.getLogger(__name__)
 
+_DIFF_OLD_FILE_RE = re.compile(r"^--- a/(.+)$")
 _DIFF_FILE_RE = re.compile(r"^\+\+\+ b/(.+)$")
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _CONTAINER_NODE_TYPES: frozenset[str] = frozenset(
@@ -334,15 +335,38 @@ def parse_unified_diff(diff_text: str) -> dict[str, list[tuple[int, int]]]:
             current_file = file_match.group(1)
             changed.setdefault(current_file, [])
             continue
+        if raw_line.startswith("+++ "):
+            current_file = None
+            continue
         if current_file is None:
             continue
         hunk_match = _DIFF_HUNK_RE.match(raw_line)
         if hunk_match:
             start = int(hunk_match.group(1))
-            count = int(hunk_match.group(2) or "1")
-            end = start + max(count, 1) - 1
-            changed[current_file].append((start, end))
+            raw_count = hunk_match.group(2)
+            count = int(raw_count) if raw_count is not None else 1
+            if count == 0:
+                anchor = max(1, start)
+                changed[current_file].append((anchor, anchor))
+            else:
+                end = start + count - 1
+                changed[current_file].append((start, end))
     return changed
+
+
+def _parse_deleted_files(diff_text: str) -> set[str]:
+    """Return relative file paths removed in diff_text (`--- a/<p>` then `+++ /dev/null`)."""
+    deleted: set[str] = set()
+    pending_old: str | None = None
+    for raw_line in diff_text.splitlines():
+        old_m = _DIFF_OLD_FILE_RE.match(raw_line)
+        if old_m:
+            pending_old = old_m.group(1)
+            continue
+        if raw_line == "+++ /dev/null" and pending_old is not None:
+            deleted.add(pending_old)
+        pending_old = None
+    return deleted
 
 
 def _rel_path(full_path: str, root: Path) -> str:
@@ -352,15 +376,46 @@ def _rel_path(full_path: str, root: Path) -> str:
         return full_path
 
 
+def _container_scope(scope_header: str) -> str:
+    """Keep enclosing scope lines from scope_header, ignoring volatile imports/includes."""
+    import_prefixes = ("import ", "from ", "#include", "use ", "using ")
+    kept = [
+        s
+        for line in scope_header.splitlines()
+        if (s := line.strip()) and not s.startswith(import_prefixes)
+    ]
+    return "\n".join(kept)
+
+
 def _index_units_by_key(
     pipeline: CodeIndexPipeline, root: Path
-) -> dict[tuple[str, str], UnifiedCodeUnit]:
-    mapping: dict[tuple[str, str], UnifiedCodeUnit] = {}
-    for unit in pipeline.store.units.values():
+) -> dict[tuple[str, str, str], UnifiedCodeUnit]:
+    mapping: dict[tuple[str, str, str], UnifiedCodeUnit] = {}
+    counts: dict[tuple[str, str, str], int] = {}
+    ordered = sorted(
+        pipeline.store.units.values(),
+        key=lambda u: (_rel_path(u.ast_chunk.file_path, root), u.ast_chunk.line_start),
+    )
+    for unit in ordered:
         rel = _rel_path(unit.ast_chunk.file_path, root)
-        if unit.ast_chunk.symbol_name:
-            mapping[(rel, unit.ast_chunk.symbol_name)] = unit
+        sym = unit.ast_chunk.symbol_name
+        if not sym:
+            continue
+        scope = _container_scope(unit.ast_chunk.scope_header)
+        base_key = (rel, scope, sym)
+        idx = counts.get(base_key, 0)
+        counts[base_key] = idx + 1
+        key = base_key if idx == 0 else (rel, scope, f"{sym}#{idx}")
+        mapping[key] = unit
     return mapping
+
+
+def _first_hunk_line(ast: ASTChunkNode, hunks: list[tuple[int, int]]) -> int:
+    """Return a line inside both the AST chunk and diff hunks for GitHub inline comments."""
+    for h_start, h_end in hunks:
+        if h_end >= ast.line_start and h_start <= ast.line_end:
+            return max(ast.line_start, min(h_start, ast.line_end))
+    return ast.line_start
 
 
 def analyze_pr_directories(
@@ -370,16 +425,21 @@ def analyze_pr_directories(
     base_ref: str = "base",
     head_ref: str = "head",
     compile_commands_path: Path | None = None,
+    head_compile_commands_path: Path | None = None,
 ) -> PRReviewReport:
     """Compare base_dir vs head_dir across all 4 layers for files/lines touched in diff_text."""
     changed_hunks = parse_unified_diff(diff_text)
+    deleted_files = _parse_deleted_files(diff_text)
 
     base_pipe = CodeIndexPipeline()
     base_pipe.index_workspace(base_dir, compile_commands_path=compile_commands_path)
     base_units = _index_units_by_key(base_pipe, base_dir)
 
     head_pipe = CodeIndexPipeline()
-    head_pipe.index_workspace(head_dir, compile_commands_path=compile_commands_path)
+    head_pipe.index_workspace(
+        head_dir,
+        compile_commands_path=head_compile_commands_path or compile_commands_path,
+    )
     head_units = _index_units_by_key(head_pipe, head_dir)
 
     deltas: list[FunctionDelta] = []
@@ -387,7 +447,7 @@ def analyze_pr_directories(
     pr_connected: list[dict[str, Any]] = []
     seen_pr_conn: set[tuple[str, str]] = set()
 
-    for (rel_file, sym_name), head_unit in sorted(head_units.items()):
+    for (rel_file, scope_hdr, sym_key), head_unit in sorted(head_units.items()):
         hunks = changed_hunks.get(rel_file)
         if hunks is None:
             continue
@@ -395,7 +455,9 @@ def analyze_pr_directories(
         if not any(h_end >= ast.line_start and h_start <= ast.line_end for h_start, h_end in hunks):
             continue
 
-        base_unit = base_units.get((rel_file, sym_name))
+        sym_name = ast.symbol_name or sym_key
+        comment_line = _first_hunk_line(ast, hunks)
+        base_unit = base_units.get((rel_file, scope_hdr, sym_key))
         c_before = base_unit.ast_chunk.cyclomatic_complexity if base_unit else None
         c_after = ast.cyclomatic_complexity
 
@@ -413,11 +475,16 @@ def analyze_pr_directories(
             ir_sim = round(cosine_similarity(v_base, v_head), 4)
             base_edges = sorted((e.flow_type, e.position) for e in base_unit.ir_graph.edges)
             head_edges = sorted((e.flow_type, e.position) for e in head_unit.ir_graph.edges)
-            bin_match = True
-            if base_unit.binary_blocks and head_unit.binary_blocks:
+            has_base_bin = bool(base_unit.binary_blocks)
+            has_head_bin = bool(head_unit.binary_blocks)
+            if has_base_bin != has_head_bin:
+                bin_match = False
+            elif has_base_bin and has_head_bin:
                 bin_match = [b.normalized_instructions for b in base_unit.binary_blocks] == [
                     b.normalized_instructions for b in head_unit.binary_blocks
                 ]
+            else:
+                bin_match = True
             if (
                 ir_sim >= 0.99
                 and base_unit.ir_graph.canonical_tokens == head_unit.ir_graph.canonical_tokens
@@ -476,7 +543,7 @@ def analyze_pr_directories(
                     severity="INFO",
                     category="NFC_VERIFIED",
                     file_path=rel_file,
-                    line=ast.line_start,
+                    line=comment_line,
                     symbol_name=sym_name,
                     message=(
                         f"LLVM IR equivalence verified (similarity={ir_sim:.4f}): "
@@ -490,7 +557,7 @@ def analyze_pr_directories(
                     severity="MEDIUM",
                     category="COMPLEXITY_SPIKE",
                     file_path=rel_file,
-                    line=ast.line_start,
+                    line=comment_line,
                     symbol_name=sym_name,
                     message=f"Cyclomatic complexity jumped from {c_before} to {c_after}.",
                 )
@@ -501,7 +568,7 @@ def analyze_pr_directories(
                     severity="MEDIUM",
                     category="LOWERING_REGRESSION",
                     file_path=rel_file,
-                    line=ast.line_start,
+                    line=comment_line,
                     symbol_name=sym_name,
                     message=(
                         f"Compiled machine-code basic blocks increased from {bb_before} "
@@ -515,7 +582,7 @@ def analyze_pr_directories(
                     severity="HIGH" if len(callers) >= 3 else "INFO",
                     category="BLAST_RADIUS",
                     file_path=rel_file,
-                    line=ast.line_start,
+                    line=comment_line,
                     symbol_name=sym_name,
                     message=f"Modified function has {len(callers)} downstream caller(s) in CPG.",
                 )
@@ -526,7 +593,7 @@ def analyze_pr_directories(
                     severity="MEDIUM",
                     category="CLONE",
                     file_path=rel_file,
-                    line=ast.line_start,
+                    line=comment_line,
                     symbol_name=sym_name,
                     message=f"Potential semantic clone(s) detected: {', '.join(clone_names)}.",
                 )
@@ -540,6 +607,38 @@ def analyze_pr_directories(
                     pr_connected.append(conn)
                     if len(pr_connected) >= 8:
                         break
+
+    # Report deleted functions that had downstream callers in base.
+    for (rel_file, scope_hdr, sym_key), base_unit in sorted(base_units.items()):
+        if (rel_file, scope_hdr, sym_key) in head_units:
+            continue
+        if rel_file not in deleted_files and rel_file not in changed_hunks:
+            continue
+        b_ast = base_unit.ast_chunk
+        if b_ast.node_kind in _CONTAINER_NODE_TYPES or base_unit.scip_symbol is None:
+            continue
+        base_slices = base_pipe.cpg.k_hop_slice(
+            base_unit.scip_symbol.symbol_uri,
+            max_hops=2,
+            edge_kinds=frozenset({CPGEdgeKind.CALLS}),
+            direction="backward",
+        )
+        base_callers = sorted({str(s["source"]) for s in base_slices})
+        if base_callers:
+            sym_name = b_ast.symbol_name or sym_key
+            findings.append(
+                ReviewFinding(
+                    severity="HIGH",
+                    category="BLAST_RADIUS",
+                    file_path=rel_file,
+                    line=b_ast.line_start,
+                    symbol_name=sym_name,
+                    message=(
+                        f"Deleted function had {len(base_callers)} downstream caller(s) "
+                        "in base CPG."
+                    ),
+                )
+            )
 
     return PRReviewReport(
         base_ref=base_ref,
@@ -571,6 +670,35 @@ def resolve_merge_base(repo: Path, base_ref: str, head_ref: str) -> str:
     return base_ref
 
 
+def _remap_compile_commands(
+    cc_path: Path | None, repo_root: Path, worktree_root: Path, out_path: Path
+) -> Path | None:
+    """Rewrite compile_commands.json paths from repo_root to worktree_root."""
+    if cc_path is None or not cc_path.exists():
+        return None
+    try:
+        entries = json.loads(cc_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    repo_str = str(repo_root.resolve())
+    wt_str = str(worktree_root.resolve())
+    remapped: list[dict[str, Any]] = []
+    for entry in entries:
+        copy = dict(entry)
+        for key in ("file", "directory"):
+            if isinstance(copy.get(key), str):
+                copy[key] = copy[key].replace(repo_str, wt_str)
+        if isinstance(copy.get("arguments"), list):
+            copy["arguments"] = [
+                str(a).replace(repo_str, wt_str) for a in copy["arguments"]
+            ]
+        if isinstance(copy.get("command"), str):
+            copy["command"] = copy["command"].replace(repo_str, wt_str)
+        remapped.append(copy)
+    out_path.write_text(json.dumps(remapped), encoding="utf-8")
+    return out_path
+
+
 def analyze_git_pr(
     repo_path: str | Path,
     base_ref: str = "HEAD~1",
@@ -587,11 +715,12 @@ def analyze_git_pr(
         text=True,
         check=True,
     )
-    cc_path = Path(compile_commands_path) if compile_commands_path else None
+    cc_path = Path(compile_commands_path).resolve() if compile_commands_path else None
 
     with tempfile.TemporaryDirectory(prefix="astraea-pr-") as tmp_root:
-        base_wt = Path(tmp_root) / "base"
-        head_wt = Path(tmp_root) / "head"
+        tmp_dir = Path(tmp_root)
+        base_wt = tmp_dir / "base"
+        head_wt = tmp_dir / "head"
         added_worktrees: list[Path] = []
         try:
             for wt_path, ref in ((base_wt, effective_base), (head_wt, head_ref)):
@@ -602,13 +731,16 @@ def analyze_git_pr(
                     check=True,
                 )
                 added_worktrees.append(wt_path)
+            base_cc = _remap_compile_commands(cc_path, repo, base_wt, tmp_dir / "cc_base.json")
+            head_cc = _remap_compile_commands(cc_path, repo, head_wt, tmp_dir / "cc_head.json")
             return analyze_pr_directories(
                 base_dir=base_wt,
                 head_dir=head_wt,
                 diff_text=diff_proc.stdout,
                 base_ref=base_ref,
                 head_ref=head_ref,
-                compile_commands_path=cc_path,
+                compile_commands_path=base_cc,
+                head_compile_commands_path=head_cc,
             )
         finally:
             for wt_path in added_worktrees:
@@ -821,13 +953,16 @@ def analyze_repository(
             ):
                 continue
             other_name = other_ast.symbol_name or "<anonymous>"
-            if other_name == sym_name:
+            other_rel = _rel_path(other_ast.file_path, root)
+            src_label = f"{rel}::{sym_name}"
+            dst_label = f"{other_rel}::{other_name}"
+            if other.unit_id == unit.unit_id or src_label == dst_label:
                 continue
-            pair = (min(sym_name, other_name), max(sym_name, other_name))
+            pair = (min(src_label, dst_label), max(src_label, dst_label))
             if pair not in seen_pairs:
                 seen_pairs.add(pair)
                 clone_pairs.append(
-                    {"source": sym_name, "target": other_name, "similarity": score}
+                    {"source": src_label, "target": dst_label, "similarity": score}
                 )
 
     clone_clusters = _cluster_clones(clone_pairs)

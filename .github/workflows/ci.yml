@@ -27,7 +27,7 @@ jobs:
           pip install -e ".[dev,gcp]"
 
       - name: Run Ruff lint
-        run: ruff check src/ tests/
+        run: ruff check src/ tests/ benchmarks/
 
       - name: Run Mypy strict typecheck
         run: mypy --strict src/

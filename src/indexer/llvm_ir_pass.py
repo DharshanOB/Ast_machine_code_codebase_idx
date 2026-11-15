@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import functools
 import os
 import re
 import resource
@@ -15,7 +16,7 @@ from llvmlite import binding as llvm
 
 from indexer.models import LLVMIRGraph, ProGraMLEdge, ProGraMLNode
 
-ALLOWED_CLANG_PREFIXES: tuple[str, ...] = ("-I", "-isystem", "-D", "-U", "-std=", "-target ")
+ALLOWED_CLANG_PREFIXES: tuple[str, ...] = ("-I", "-isystem", "-D", "-U", "-std=", "--target=")
 MAX_GRAPH_NODES: int = 10_000
 MAX_COMPILER_TIMEOUT_S: float = 15.0
 MAX_COMPILER_MEMORY_BYTES: int = 2 * 1024 * 1024 * 1024  # 2 GB
@@ -25,7 +26,49 @@ atexit.register(shutil.rmtree, BUILD_TMP_ROOT, True)
 _SSA_REG_RE = re.compile(r"%([A-Za-z0-9_.$-]+)")
 _DBG_REF_RE = re.compile(r"!dbg\s+!(\d+)")
 _DBG_LOC_RE = re.compile(r"^!(\d+)\s*=\s*!DILocation\(line:\s*(\d+)")
+_DISUBPROGRAM_RE = re.compile(
+    r'^!(\d+)\s*=\s*(?:distinct\s+)?!DISubprogram\(([^)]+)\)'
+)
+_DISUB_NAME_RE = re.compile(r'\bname:\s*"([^"]+)"')
+_DISUB_LINKAGE_RE = re.compile(r'\blinkageName:\s*"([^"]+)"')
+_DISUB_LINE_RE = re.compile(r'\bline:\s*(\d+)')
+_DEFINE_DBG_RE = re.compile(r'^define\b[^@]*@(?:"([^"]+)"|([A-Za-z0-9_.$-]+))\b.*?(!dbg\s+!(\d+))?')
 _OPCODE_RE = re.compile(r"^(?:%[^\s=]+\s*=\s*)?([a-zA-Z0-9_.]+)")
+
+
+@functools.lru_cache(maxsize=2048)
+def extract_leaf_symbol_name(raw_name: str) -> str:
+    """Best-effort demangle/strip C++ Itanium or Rust mangled symbol to leaf identifier."""
+    clean = raw_name.strip().lstrip("@")
+    if not clean:
+        return ""
+    # Fast path for unmangled symbols
+    if not clean.startswith(("_Z", "__Z", "_R")):
+        return clean.split("::")[-1]
+    cppfilt = shutil.which("c++filt")
+    if cppfilt is not None and clean.startswith(("_Z", "__Z")):
+        try:
+            proc = subprocess.run(
+                [cppfilt, clean],
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            demangled = proc.stdout.strip()
+            if proc.returncode == 0 and demangled and demangled != clean:
+                base = demangled.split("(", 1)[0].strip()
+                return base.split("::")[-1].split()[-1]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Rust v0 mangling: _RNv...<len><ident>...
+    if clean.startswith("_R"):
+        segs = re.findall(r"(\d+)([A-Za-z_][A-Za-z0-9_]*)", clean)
+        for length_s, ident in reversed(segs):
+            if len(ident) >= int(length_s):
+                return str(ident[: int(length_s)])
+    return clean
 
 
 def sanitize_compile_flags(raw_flags: list[str]) -> list[str]:
@@ -38,9 +81,13 @@ def sanitize_compile_flags(raw_flags: list[str]) -> list[str]:
             continue
         if flag.startswith("@"):
             continue
-        if flag in ("-I", "-isystem", "-D", "-U") and i + 1 < len(raw_flags):
+        if flag in ("-I", "-isystem", "-D", "-U", "-target") and i + 1 < len(raw_flags):
             arg = raw_flags[i + 1]
-            if not arg.startswith("@") and "-fplugin" not in arg:
+            if (
+                not arg.startswith("@")
+                and "-fplugin" not in arg
+                and not (flag == "-target" and arg.startswith("-"))
+            ):
                 safe_flags.extend([flag, arg])
             skip_next = True
         elif flag.startswith(ALLOWED_CLANG_PREFIXES) and "-fplugin" not in flag:
@@ -167,13 +214,17 @@ class LLVMIRPass:
     def parse_ir_module(self, ir_text: str, source_file: str = "<memory>") -> list[LLVMIRGraph]:
         """Parse LLVM IR assembly text into per-function ProGraML LLVMIRGraph models."""
         mod = llvm.parse_assembly(ir_text)
-        dbg_lines = self._extract_dbg_locations(str(mod))
+        mod_text = str(mod)
+        dbg_lines = self._extract_dbg_locations(mod_text)
+        subprogram_meta = self._extract_subprogram_metadata(mod_text)
         graphs: list[LLVMIRGraph] = []
 
         for func in mod.functions:
             if func.is_declaration:
                 continue
-            graphs.append(self._build_function_graph(func, source_file, dbg_lines))
+            graphs.append(
+                self._build_function_graph(func, source_file, dbg_lines, subprogram_meta)
+            )
         return graphs
 
     def _build_function_graph(
@@ -181,6 +232,7 @@ class LLVMIRPass:
         func: llvm.ValueRef,
         source_file: str,
         dbg_lines: dict[str, int],
+        subprogram_meta: dict[str, tuple[str, int | None]] | None = None,
     ) -> LLVMIRGraph:
         nodes: list[ProGraMLNode] = []
         edges: list[ProGraMLEdge] = []
@@ -189,9 +241,11 @@ class LLVMIRPass:
         reg_def_node: dict[str, int] = {}
         block_entry_node: dict[str, int] = {}
         block_exit_node: dict[str, int] = {}
+        inst_rhs_list: list[tuple[int, str]] = []
         truncated = False
 
-        # Pre-register basic block entry/exit nodes for control-flow linking.
+        # Pass 1: register instruction nodes, intra-block ctrl edges, and all SSA definitions
+        # so loop-carried phi back-edges resolve to defining instructions rather than params.
         blocks = list(func.blocks)
         for bb in blocks:
             bb_name = bb.name or f"bb_{len(block_entry_node)}"
@@ -232,45 +286,48 @@ class LLVMIRPass:
                     )
                 prev_inst_id = nid
 
-                # Track SSA definition if instruction assigns %name = ...
                 if "=" in raw_inst:
-                    lhs = raw_inst.split("=", 1)[0].strip()
-                    if lhs.startswith("%"):
-                        reg_def_node[lhs] = nid
-
-                # Link SSA data-dependency edges from operands to this instruction.
-                rhs = raw_inst.split("=", 1)[1] if "=" in raw_inst else raw_inst
-                for pos, op_match in enumerate(_SSA_REG_RE.finditer(rhs)):
-                    op_reg = f"%{op_match.group(1)}"
-                    if op_reg in reg_def_node and reg_def_node[op_reg] != nid:
-                        edges.append(
-                            ProGraMLEdge(
-                                source=reg_def_node[op_reg],
-                                target=nid,
-                                flow_type="data",
-                                position=pos,
-                            )
-                        )
-                    elif op_reg not in reg_def_node and len(nodes) < MAX_GRAPH_NODES:
-                        val_id = len(nodes)
-                        nodes.append(
-                            ProGraMLNode(
-                                node_id=val_id,
-                                node_type="val",
-                                text="<SSA_PARAM>",
-                                opcode="",
-                            )
-                        )
-                        reg_def_node[op_reg] = val_id
-                        edges.append(
-                            ProGraMLEdge(source=val_id, target=nid, flow_type="data", position=pos)
-                        )
+                    lhs, rhs = raw_inst.split("=", 1)
+                    lhs_clean = lhs.strip()
+                    if lhs_clean.startswith("%"):
+                        reg_def_node[lhs_clean] = nid
+                else:
+                    rhs = raw_inst
+                inst_rhs_list.append((nid, rhs))
 
                 if opcode == "call":
                     edges.append(ProGraMLEdge(source=nid, target=nid, flow_type="call", position=0))
 
             if truncated:
                 break
+
+        # Pass 2: link SSA data-dependency edges using the complete per-function def map.
+        for nid, rhs in inst_rhs_list:
+            for pos, op_match in enumerate(_SSA_REG_RE.finditer(rhs)):
+                op_reg = f"%{op_match.group(1)}"
+                if op_reg in reg_def_node and reg_def_node[op_reg] != nid:
+                    edges.append(
+                        ProGraMLEdge(
+                            source=reg_def_node[op_reg],
+                            target=nid,
+                            flow_type="data",
+                            position=pos,
+                        )
+                    )
+                elif op_reg not in reg_def_node and len(nodes) < MAX_GRAPH_NODES:
+                    val_id = len(nodes)
+                    nodes.append(
+                        ProGraMLNode(
+                            node_id=val_id,
+                            node_type="val",
+                            text="<SSA_PARAM>",
+                            opcode="",
+                        )
+                    )
+                    reg_def_node[op_reg] = val_id
+                    edges.append(
+                        ProGraMLEdge(source=val_id, target=nid, flow_type="data", position=pos)
+                    )
 
         # Link inter-block control-flow edges (including phi/loop back-edges).
         for bb in blocks:
@@ -289,8 +346,14 @@ class LLVMIRPass:
                         )
                     )
 
+        src_name, decl_line = (subprogram_meta or {}).get(func.name, ("", None))
+        if not src_name:
+            src_name = extract_leaf_symbol_name(func.name)
+
         return LLVMIRGraph(
             function_name=func.name,
+            source_name=src_name,
+            decl_line=decl_line,
             source_file=source_file,
             nodes=nodes,
             edges=edges,
@@ -308,3 +371,38 @@ class LLVMIRPass:
             if m:
                 mapping[f"!{m.group(1)}"] = int(m.group(2))
         return mapping
+
+    @staticmethod
+    def _extract_subprogram_metadata(ir_text: str) -> dict[str, tuple[str, int | None]]:
+        """Map LLVM function symbol names to (unmangled_name, decl_line) via !DISubprogram."""
+        subprograms: dict[str, tuple[str, str, int | None]] = {}
+        by_linkage: dict[str, tuple[str, int | None]] = {}
+        for line in ir_text.splitlines():
+            m = _DISUBPROGRAM_RE.match(line.strip())
+            if not m:
+                continue
+            dbg_id = f"!{m.group(1)}"
+            body = m.group(2)
+            name_m = _DISUB_NAME_RE.search(body)
+            if not name_m:
+                continue
+            name = name_m.group(1)
+            line_m = _DISUB_LINE_RE.search(body)
+            decl_line = int(line_m.group(1)) if line_m else None
+            link_m = _DISUB_LINKAGE_RE.search(body)
+            linkage = link_m.group(1) if link_m else ""
+            subprograms[dbg_id] = (name, linkage, decl_line)
+            if linkage:
+                by_linkage[linkage] = (name, decl_line)
+
+        result: dict[str, tuple[str, int | None]] = dict(by_linkage)
+        for line in ir_text.splitlines():
+            dm = _DEFINE_DBG_RE.match(line.strip())
+            if not dm:
+                continue
+            fn_name = dm.group(1) or dm.group(2) or ""
+            dbg_num = dm.group(4)
+            if fn_name and dbg_num and f"!{dbg_num}" in subprograms:
+                sp_name, _, sp_line = subprograms[f"!{dbg_num}"]
+                result[fn_name] = (sp_name, sp_line)
+        return result

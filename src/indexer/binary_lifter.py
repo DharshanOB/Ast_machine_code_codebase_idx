@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 from itertools import islice
 from pathlib import Path
+from typing import Any
 
 import capstone
 import lief
@@ -15,6 +17,7 @@ import lief
 from indexer.llvm_ir_pass import (
     BUILD_TMP_ROOT,
     MAX_COMPILER_TIMEOUT_S,
+    _apply_resource_limits,
     resolve_clang_binary,
     sanitize_compile_flags,
 )
@@ -145,6 +148,12 @@ class BinaryLifter:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         self._owned_tmp_dirs.clear()
 
+    def __enter__(self) -> BinaryLifter:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.cleanup()
+
     def compile_to_object(
         self,
         source_path: str | Path,
@@ -184,6 +193,7 @@ class BinaryLifter:
             capture_output=True,
             text=True,
             timeout=MAX_COMPILER_TIMEOUT_S,
+            preexec_fn=_apply_resource_limits if os.name == "posix" else None,
         )
         if proc.returncode != 0 or not target_path.exists():
             raise RuntimeError(f"Object compilation failed: {proc.stderr.strip()}")
@@ -223,6 +233,7 @@ class BinaryLifter:
             capture_output=True,
             text=True,
             timeout=MAX_COMPILER_TIMEOUT_S,
+            preexec_fn=_apply_resource_limits if os.name == "posix" else None,
         )
         if proc.returncode != 0 or not target_path.exists():
             raise RuntimeError(f"Rustc object compilation failed: {proc.stderr.strip()}")
@@ -231,7 +242,7 @@ class BinaryLifter:
     def lift_elf(
         self, elf_path: str | Path, function_filter: str | None = None
     ) -> dict[str, list[BinaryBasicBlock]]:
-        """Parse an ELF binary/object with LIEF and disassemble its .text function symbols."""
+        """Parse an ELF binary/object with LIEF and disassemble its code function symbols."""
         path = Path(elf_path)
         if not path.exists():
             return {}
@@ -241,15 +252,14 @@ class BinaryLifter:
             return {}
 
         arch = self._detect_arch(binary)
-        text_section = binary.get_section(".text")
-        if text_section is None:
-            return {}
-
-        text_bytes = bytes(text_section.content)
-        text_va = int(text_section.virtual_address)
+        sections_list = list(binary.sections)
+        default_text = binary.get_section(".text")
+        section_cache: dict[str, tuple[bytes, int]] = {}
         result: dict[str, list[BinaryBasicBlock]] = {}
 
-        for sym in binary.symbols:
+        # Iterate both static symtab and dynamic symbols (supports stripped shared/exec ELFs).
+        seen_syms: set[tuple[str, int]] = set()
+        for sym in (*binary.symtab_symbols, *binary.dynamic_symbols):
             if getattr(sym.type, "name", "") != "FUNC" or sym.size <= 0:
                 continue
             sym_name = (
@@ -257,12 +267,32 @@ class BinaryLifter:
                 if isinstance(sym.name, bytes)
                 else str(sym.name)
             )
-            if function_filter and sym_name != function_filter:
+            if not sym_name or (function_filter and sym_name != function_filter):
                 continue
-            offset = int(sym.value) - text_va
-            if offset < 0 or offset >= len(text_bytes):
+            sym_key = (sym_name, int(sym.value))
+            if sym_key in seen_syms:
                 continue
-            func_bytes = text_bytes[offset : offset + int(sym.size)]
+            seen_syms.add(sym_key)
+
+            sec: Any = getattr(sym, "section", None)
+            if sec is None and 0 <= int(sym.shndx) < len(sections_list):
+                sec = sections_list[int(sym.shndx)]
+            if sec is None:
+                sec = default_text
+            if sec is None:
+                continue
+            sec_name = str(getattr(sec, "name", ""))
+            if not sec_name.startswith(".text"):
+                continue
+
+            if sec_name not in section_cache:
+                section_cache[sec_name] = (bytes(sec.content), int(sec.virtual_address))
+            sec_bytes, sec_va = section_cache[sec_name]
+
+            offset = int(sym.value) - sec_va
+            if offset < 0 or offset >= len(sec_bytes):
+                continue
+            func_bytes = sec_bytes[offset : offset + int(sym.size)]
             blocks = self.lift_bytes(
                 code=func_bytes,
                 base_va=int(sym.value),

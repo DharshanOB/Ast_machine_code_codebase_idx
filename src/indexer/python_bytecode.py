@@ -67,7 +67,9 @@ def _build_code_cfg_and_blocks(
                 edges.append(ProGraMLEdge(source=idx, target=target_idx, flow_type="ctrl"))
 
     graph = LLVMIRGraph(
-        function_name=code_obj.co_name,
+        function_name=code_obj.co_qualname,
+        source_name=code_obj.co_name,
+        decl_line=code_obj.co_firstlineno,
         source_file=source_file,
         nodes=nodes,
         edges=edges,
@@ -146,15 +148,17 @@ def lower_python_file(
                 stack.append(const)
 
         name = code_obj.co_name
+        qualname = getattr(code_obj, "co_qualname", name)
         if name == "<module>":
             key = ""
         elif name.startswith("<"):
             continue
         else:
-            key = name
+            key = qualname
         graph, blocks = _build_code_cfg_and_blocks(code_obj, path_str)
-        if key not in ir_by_fn:
-            ir_by_fn[key] = graph
-            blocks_by_fn[key] = blocks
+        if key in ir_by_fn:
+            key = f"{key}#{code_obj.co_firstlineno}"
+        ir_by_fn[key] = graph
+        blocks_by_fn[key] = blocks
 
     return ir_by_fn, blocks_by_fn

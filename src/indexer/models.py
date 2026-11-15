@@ -69,6 +69,8 @@ class ASTChunkNode(BaseModel):
             self.chunk_id = compute_content_sha256(
                 "ast",
                 self.language.value,
+                self.file_path,
+                self.line_start,
                 self.node_kind,
                 self.scope_header,
                 self.source_text,
@@ -130,6 +132,8 @@ class LLVMIRGraph(BaseModel):
 
     ir_id: str = ""
     function_name: str
+    source_name: str = ""
+    decl_line: int | None = None
     source_file: str
     nodes: list[ProGraMLNode] = Field(default_factory=list)
     edges: list[ProGraMLEdge] = Field(default_factory=list)

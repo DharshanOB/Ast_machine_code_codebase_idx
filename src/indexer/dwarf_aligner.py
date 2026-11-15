@@ -75,18 +75,58 @@ class DWARFAligner:
     def attach_ir_dbg_ids(
         self, mappings: list[DWARFLineMapping], ir_graphs: list[LLVMIRGraph]
     ) -> list[DWARFLineMapping]:
-        """Link LLVM IR !dbg IDs to DWARFLineMapping records by matching source line numbers."""
+        """Link LLVM IR !dbg IDs to DWARFLineMapping records by file + source line."""
+        scoped_dbg: dict[tuple[str, int], list[str]] = {}
         line_to_dbg: dict[int, list[str]] = {}
         for graph in ir_graphs:
+            src_base = Path(graph.source_file).name if graph.source_file != "<memory>" else ""
             for dbg_id, line_no in graph.dbg_line_map.items():
                 line_to_dbg.setdefault(line_no, [])
                 if dbg_id not in line_to_dbg[line_no]:
                     line_to_dbg[line_no].append(dbg_id)
+                if src_base:
+                    scoped_dbg.setdefault((src_base, line_no), [])
+                    if dbg_id not in scoped_dbg[(src_base, line_no)]:
+                        scoped_dbg[(src_base, line_no)].append(dbg_id)
 
         for m in mappings:
-            if m.line_start in line_to_dbg:
-                m.dbg_ids = list(line_to_dbg[m.line_start])
+            m_base = Path(m.file_path).name if m.file_path else ""
+            matched = scoped_dbg.get((m_base, m.line_start)) if m_base else None
+            if matched is None and (not m_base or not scoped_dbg):
+                matched = line_to_dbg.get(m.line_start)
+            if matched:
+                m.dbg_ids = list(matched)
         return mappings
+
+    def extract_subprogram_info(self, elf_path: str | Path) -> dict[str, tuple[str, int | None]]:
+        """Map ELF symbol/linkage names to (unmangled_name, decl_line) from DWARF subprograms."""
+        path = Path(elf_path)
+        if not path.exists():
+            return {}
+        info: dict[str, tuple[str, int | None]] = {}
+        with path.open("rb") as fh:
+            elf = ELFFile(fh)
+            if not elf.has_dwarf_info():
+                return {}
+            dwarf = elf.get_dwarf_info()
+            for cu in dwarf.iter_CUs():
+                for die in cu.iter_DIEs():
+                    if die.tag != "DW_TAG_subprogram":
+                        continue
+                    name = self._die_str_attr(die, "DW_AT_name")
+                    linkage = self._die_str_attr(die, "DW_AT_linkage_name") or self._die_str_attr(
+                        die, "DW_AT_MIPS_linkage_name"
+                    )
+                    if not name and not linkage:
+                        continue
+                    decl_attr = die.attributes.get("DW_AT_decl_line")
+                    decl_line = int(decl_attr.value) if decl_attr is not None else None
+                    resolved_name = name or linkage
+                    if linkage:
+                        info[linkage] = (resolved_name, decl_line)
+                    if name:
+                        info.setdefault(name, (resolved_name, decl_line))
+        return info
 
     def lookup_va_for_line(
         self, mappings: list[DWARFLineMapping], line_start: int, line_end: int | None = None
@@ -121,32 +161,81 @@ class DWARFAligner:
         return 0
 
     @staticmethod
+    def _die_str_attr(die: Any, attr_name: str) -> str:
+        attr = die.attributes.get(attr_name)
+        if attr is None:
+            return ""
+        val = attr.value
+        return val.decode("utf-8", errors="replace") if isinstance(val, bytes) else str(val)
+
+    @staticmethod
     def _extract_inlined_subroutines(dwarf: Any) -> list[tuple[int, int, str]]:
         ranges: list[tuple[int, int, str]] = []
+        try:
+            range_lists = dwarf.range_lists()
+        except Exception:
+            range_lists = None
+
         for cu in dwarf.iter_CUs():
+            cu_base = 0
+            try:
+                top_die = cu.get_top_DIE()
+                cu_low = top_die.attributes.get("DW_AT_low_pc")
+                if cu_low is not None:
+                    cu_base = int(cu_low.value)
+            except Exception:
+                pass
+
             for die in cu.iter_DIEs():
                 if die.tag != "DW_TAG_inlined_subroutine":
                     continue
+                origin_name = DWARFAligner._resolve_inlined_name(die)
                 low_pc = die.attributes.get("DW_AT_low_pc")
                 high_pc = die.attributes.get("DW_AT_high_pc")
-                if low_pc is None or high_pc is None:
+                if low_pc is not None and high_pc is not None:
+                    start = int(low_pc.value)
+                    end = (
+                        start + int(high_pc.value)
+                        if high_pc.form.startswith("DW_FORM_data")
+                        else int(high_pc.value)
+                    )
+                    ranges.append((start, end, origin_name))
                     continue
-                start = int(low_pc.value)
-                end = (
-                    start + int(high_pc.value)
-                    if high_pc.form.startswith("DW_FORM_data")
-                    else int(high_pc.value)
-                )
-                origin_name = DWARFAligner._resolve_inlined_name(die)
-                ranges.append((start, end, origin_name))
+
+                ranges_attr = die.attributes.get("DW_AT_ranges")
+                if ranges_attr is not None and range_lists is not None:
+                    try:
+                        rlist = range_lists.get_range_list_at_offset(int(ranges_attr.value), cu=cu)
+                        base = cu_base
+                        for entry in rlist:
+                            if hasattr(entry, "base_address"):
+                                base = int(entry.base_address)
+                            elif hasattr(entry, "begin_offset") and hasattr(entry, "end_offset"):
+                                ranges.append(
+                                    (
+                                        base + int(entry.begin_offset),
+                                        base + int(entry.end_offset),
+                                        origin_name,
+                                    )
+                                )
+                    except Exception:
+                        pass
         return ranges
 
     @staticmethod
     def _resolve_inlined_name(die: Any) -> str:
-        name_attr = die.attributes.get("DW_AT_name")
-        if name_attr is not None:
-            val = name_attr.value
-            return val.decode("utf-8", errors="replace") if isinstance(val, bytes) else str(val)
+        name = DWARFAligner._die_str_attr(die, "DW_AT_name")
+        if name:
+            return name
+        if "DW_AT_abstract_origin" in die.attributes:
+            try:
+                origin = die.get_DIE_from_attribute("DW_AT_abstract_origin")
+                if origin is not None:
+                    origin_name = DWARFAligner._die_str_attr(origin, "DW_AT_name")
+                    if origin_name:
+                        return origin_name
+            except Exception:
+                pass
         call_line = die.attributes.get("DW_AT_call_line")
         if call_line is not None:
             return f"inlined@line:{call_line.value}"

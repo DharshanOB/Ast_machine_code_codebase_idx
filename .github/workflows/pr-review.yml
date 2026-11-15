@@ -51,12 +51,19 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_GENAI_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.inputs.base_ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_LOCATION: ${{ vars.GCP_LOCATION || 'global' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}
         run: |
-          BASE_REF="${{ github.event.pull_request.base.sha || github.event.inputs.base_ref }}"
-          HEAD_REF="${{ github.event.pull_request.head.sha || github.event.inputs.head_ref }}"
-          EXTRA_ARGS=""
-          if [ -n "${{ vars.GCP_PROJECT_ID }}" ]; then
-            EXTRA_ARGS="--vertex-project ${{ vars.GCP_PROJECT_ID }} --vertex-location ${{ vars.GCP_LOCATION || 'global' }} --gemini-model ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}"
+          extra_args=()
+          if [ -n "$GCP_PROJECT_ID" ]; then
+            extra_args=(
+              --vertex-project "$GCP_PROJECT_ID"
+              --vertex-location "$GCP_LOCATION"
+              --gemini-model "$GEMINI_MODEL"
+            )
           fi
           astraea-review \
             --mode pr \
@@ -65,7 +72,7 @@ jobs:
             --head "$HEAD_REF" \
             --out-md pr_review_summary.md \
             --out-comments pr_review_comments.json \
-            $EXTRA_ARGS
+            "${extra_args[@]}"
           cat pr_review_summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post PR Summary & Inline Review Comments
@@ -78,10 +85,12 @@ jobs:
         run: |
           gh pr comment "$PR_NUMBER" --body-file pr_review_summary.md
           python3 - <<'EOF'
-          import json, os, subprocess
-          comments = json.loads(open("pr_review_comments.json").read())
+          import json, os, subprocess, sys
+          with open("pr_review_comments.json", encoding="utf-8") as fh:
+              comments = json.load(fh)
+          failed = 0
           for c in comments[:15]:
-              subprocess.run([
+              proc = subprocess.run([
                   "gh", "api",
                   f"repos/{os.environ['REPO']}/pulls/{os.environ['PR_NUMBER']}/comments",
                   "-f", f"body={c['body']}",
@@ -89,5 +98,13 @@ jobs:
                   "-f", f"path={c['path']}",
                   "-F", f"line={c['line']}",
                   "-f", "side=RIGHT",
-              ], check=False)
+              ], capture_output=True, text=True, check=False)
+              if proc.returncode != 0:
+                  failed += 1
+                  print(
+                      f"::warning::Failed inline comment on {c['path']}:{c['line']}: {proc.stderr.strip()}",
+                      file=sys.stderr,
+                  )
+          if failed:
+              print(f"Inline comment posting completed with {failed} failure(s).", file=sys.stderr)
           EOF

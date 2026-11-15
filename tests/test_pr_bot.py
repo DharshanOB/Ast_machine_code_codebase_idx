@@ -238,3 +238,125 @@ def test_cli_repo_mode_and_corrupt_baseline(tmp_path: Path) -> None:
     assert rc == 0
     assert "Baseline Warning" in out_md.read_text(encoding="utf-8")
     assert '"hotspots"' in baseline.read_text(encoding="utf-8")
+
+
+def test_pr_bot_deleted_function_blast_radius_and_inline_hunk_anchoring(tmp_path: Path) -> None:
+    """Deleting a referenced function reports BLAST_RADIUS and inline lines anchor to hunk."""
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    (base / "pkg").mkdir(parents=True)
+    (head / "pkg").mkdir(parents=True)
+
+    (base / "pkg" / "legacy.py").write_text(
+        "def legacy_fn(x: int) -> int:\n    return x + 1\n",
+        encoding="utf-8",
+    )
+    (base / "pkg" / "app.py").write_text(
+        "from pkg.legacy import legacy_fn\n"
+        "def compute(x: int) -> int:\n"
+        "    a = legacy_fn(x)\n"
+        "    b = a + 1\n"
+        "    if b > 0:\n"
+        "        return b\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    # Head deletes legacy.py and increases complexity inside compute() at line 4.
+    (head / "pkg" / "app.py").write_text(
+        "def compute(x: int) -> int:\n"
+        "    if x == 1:\n"
+        "        return 1\n"
+        "    if x == 2 or x == 3:\n"
+        "        return 2\n"
+        "    if x == 4 and x != 0:\n"
+        "        return 4\n"
+        "    return 0\n",
+        encoding="utf-8",
+    )
+    # Build explicit single-hunk diff touching line 4 in head (inside compute lines 1..8)
+    diff_text = (
+        "diff --git a/pkg/legacy.py b/pkg/legacy.py\n"
+        "--- a/pkg/legacy.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-def legacy_fn(x: int) -> int:\n"
+        "-    return x + 1\n"
+        "diff --git a/pkg/app.py b/pkg/app.py\n"
+        "--- a/pkg/app.py\n"
+        "+++ b/pkg/app.py\n"
+        "@@ -5,2 +4,2 @@\n"
+    )
+    report = analyze_pr_directories(base, head, diff_text=diff_text)
+    blast_syms = {f.symbol_name for f in report.findings if f.category == "BLAST_RADIUS"}
+    assert "legacy_fn" in blast_syms
+    comp_finding = next(f for f in report.findings if f.symbol_name == "compute")
+    assert comp_finding.line == 4
+    comments = report.to_github_review_comments()
+    comp_comment = next(c for c in comments if c["path"] == "pkg/app.py")
+    assert comp_comment["line"] == 4
+
+
+@pytest.mark.skipif(resolve_clang_binary() is None, reason="clang-18/clang not installed")
+def test_pr_bot_nfc_false_when_head_loses_binary_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NFC verification must be False when base has machine-code blocks but head has none."""
+    from indexer.binary_lifter import BinaryLifter
+    from indexer.models import BinaryBasicBlock
+
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    base.mkdir()
+    head.mkdir()
+    code = "int same_fn(int x) { return x + 1; }\n"
+    (base / "f.c").write_text(code, encoding="utf-8")
+    (head / "f.c").write_text(code, encoding="utf-8")
+
+    orig_lift = BinaryLifter.lift_elf
+    calls = {"n": 0}
+
+    def toggle_lift(self: BinaryLifter, obj_path: Path) -> dict[str, list[BinaryBasicBlock]]:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return {}
+        return orig_lift(self, obj_path)
+
+    monkeypatch.setattr(BinaryLifter, "lift_elf", toggle_lift)
+    diff_text = "diff --git a/f.c b/f.c\n--- a/f.c\n+++ b/f.c\n@@ -1,1 +1,1 @@\n"
+    report = analyze_pr_directories(base, head, diff_text=diff_text)
+    delta = next(d for d in report.changed_functions if d.symbol_name == "same_fn")
+    assert delta.binary_blocks_before is not None and delta.binary_blocks_before > 0
+    assert delta.binary_blocks_after == 0
+    assert delta.nfc_verified is False
+
+
+def test_remap_compile_commands_for_worktree(tmp_path: Path) -> None:
+    """_remap_compile_commands rewrites repo_root paths to worktree_root."""
+    import json
+
+    from pr_bot.analyzer import _remap_compile_commands
+
+    repo_root = tmp_path / "repo"
+    wt_root = tmp_path / "wt"
+    repo_root.mkdir()
+    wt_root.mkdir()
+    src_cc = tmp_path / "compile_commands.json"
+    src_cc.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(repo_root),
+                    "file": str(repo_root / "src" / "main.c"),
+                    "arguments": ["clang", f"-I{repo_root / 'include'}", "-O2"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out_cc = tmp_path / "remapped.json"
+    res = _remap_compile_commands(src_cc, repo_root, wt_root, out_cc)
+    assert res == out_cc
+    data = json.loads(out_cc.read_text(encoding="utf-8"))
+    assert data[0]["directory"] == str(wt_root.resolve())
+    assert data[0]["file"] == str(wt_root.resolve() / "src" / "main.c")
+    assert f"-I{wt_root.resolve() / 'include'}" in data[0]["arguments"]

@@ -254,3 +254,111 @@ def test_validate_cpg_edges_against_llvm_ir_calls(tmp_path: Path) -> None:
 
     validation = cpg.validate_against_ir_calls(graphs)
     assert ("caller", "leaf") in validation["confirmed"]
+
+
+def test_phi_loop_backedge_and_target_flag_sanitization() -> None:
+    """Two-pass SSA builder preserves loop-carried phi back-edges and allows target flags."""
+    ir_sample = """
+define i32 @loop_sum(i32 %n) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %next = add i32 %i, 1
+  %cond = icmp slt i32 %next, %n
+  br i1 %cond, label %loop, label %exit
+exit:
+  ret i32 %next
+}
+"""
+    graphs = LLVMIRPass().parse_ir_module(ir_sample, source_file="loop.c")
+    assert len(graphs) == 1
+    nodes_by_id = {n.node_id: n for n in graphs[0].nodes}
+    phi_back_edges = [
+        e
+        for e in graphs[0].edges
+        if e.flow_type == "data"
+        and nodes_by_id[e.target].opcode == "phi"
+        and nodes_by_id[e.source].opcode == "add"
+    ]
+    assert len(phi_back_edges) >= 1
+
+    safe = sanitize_compile_flags(
+        ["--target=x86_64-unknown-linux-gnu", "-target", "aarch64-linux-gnu", "-fplugin=bad.so"]
+    )
+    assert safe == ["--target=x86_64-unknown-linux-gnu", "-target", "aarch64-linux-gnu"]
+
+
+@pytest.mark.skipif(resolve_clang_binary() is None, reason="clang-18/clang not installed in VM")
+def test_cpp_function_sections_and_header_not_applicable(tmp_path: Path) -> None:
+    """C++ mangled functions with -ffunction-sections and .hpp headers lower cleanly."""
+    from indexer.models import IRStatus
+    from mcp_server.code_index_server import CodeIndexPipeline
+
+    (tmp_path / "ops.hpp").write_text(
+        "namespace math { int square(int x); }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ops.cpp").write_text(
+        '#include "ops.hpp"\n'
+        "namespace math {\n"
+        "int square(int x) { return x * x + 1; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    cc_path = tmp_path / "compile_commands.json"
+    cc_path.write_text(
+        '[{"directory": "'
+        + str(tmp_path)
+        + '", "file": "'
+        + str(tmp_path / "ops.cpp")
+        + '", "arguments": ["clang++", "-O1", "-ffunction-sections"]}]',
+        encoding="utf-8",
+    )
+    pipeline = CodeIndexPipeline(storage_dir=tmp_path / ".astraea")
+    try:
+        res = pipeline.index_workspace(str(tmp_path), compile_commands_path=str(cc_path))
+        assert res["indexed_units"] >= 2
+        units = list(pipeline.store.units.values())
+        header_units = [u for u in units if u.ast_chunk.file_path.endswith("ops.hpp")]
+        cpp_units = [u for u in units if u.ast_chunk.file_path.endswith("ops.cpp")]
+        assert header_units and all(u.ir_status == IRStatus.NOT_APPLICABLE for u in header_units)
+        sq = next(u for u in cpp_units if u.ast_chunk.symbol_name == "square")
+        assert sq.ir_status == IRStatus.OK
+        assert sq.ir_graph is not None
+        assert len(sq.binary_blocks) > 0
+    finally:
+        pipeline.store.close()
+
+
+def test_rust_text_section_elf_lifting_and_indexing(tmp_path: Path) -> None:
+    """Rust per-function .text.* ELF sections and v0 mangled IR match end-to-end."""
+    import shutil
+
+    if shutil.which("rustc") is None:
+        pytest.skip("rustc not installed in VM")
+
+    from indexer.models import IRStatus
+    from mcp_server.code_index_server import CodeIndexPipeline
+
+    (tmp_path / "lib.rs").write_text(
+        "#[inline(never)]\n"
+        "pub fn double_plus(x: i32) -> i32 {\n"
+        "    if x > 0 { x * 2 + 1 } else { 1 }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    pipeline = CodeIndexPipeline(storage_dir=tmp_path / ".astraea")
+    try:
+        res = pipeline.index_workspace(str(tmp_path))
+        assert res["indexed_units"] >= 1
+        units = [
+            u for u in pipeline.store.units.values() if u.ast_chunk.symbol_name == "double_plus"
+        ]
+        assert len(units) == 1
+        unit = units[0]
+        assert unit.ir_status == IRStatus.OK
+        assert unit.ir_graph is not None
+        assert len(unit.binary_blocks) > 0
+    finally:
+        pipeline.store.close()

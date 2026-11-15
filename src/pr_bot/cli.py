@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 from pathlib import Path
@@ -16,6 +17,8 @@ from pr_bot.analyzer import (
     resolve_merge_base,
 )
 from pr_bot.gemini_reviewer import generate_vertex_gemini_review
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -87,22 +90,44 @@ def main(argv: list[str] | None = None) -> int:
             text=True,
             check=False,
         )
-        diff_text = diff_proc.stdout
+        if diff_proc.returncode != 0:
+            logger.warning(
+                "git diff failed (rc=%d): %s",
+                diff_proc.returncode,
+                diff_proc.stderr.strip(),
+            )
+            diff_text = ""
+        else:
+            diff_text = diff_proc.stdout
 
     markdown = report.to_markdown()
-    has_api_key = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+    has_api_key = bool(
+        os.environ.get("VERTEX_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+    )
     if args.vertex_project or has_api_key:
-        ai_review = generate_vertex_gemini_review(
-            report=report,
-            diff_text=diff_text,
-            project=args.vertex_project,
-            location=args.vertex_location,
-            model=args.gemini_model,
-        )
-        if ai_review:
-            markdown = (
-                f"{markdown}\n### Gemini Review ({args.gemini_model})\n\n{ai_review}\n"
+        try:
+            ai_review = generate_vertex_gemini_review(
+                report=report,
+                diff_text=diff_text,
+                project=args.vertex_project,
+                location=args.vertex_location,
+                model=args.gemini_model,
             )
+        except Exception as exc:
+            logger.warning(
+                "Gemini review generation failed (%s); writing deterministic report", exc
+            )
+            markdown = (
+                f"{markdown}\n> **Note:** AI review unavailable "
+                f"(`{type(exc).__name__}`); deterministic 4-layer report emitted.\n"
+            )
+        else:
+            if ai_review:
+                markdown = (
+                    f"{markdown}\n### Gemini Review ({args.gemini_model})\n\n{ai_review}\n"
+                )
 
     Path(args.out_md).write_text(markdown, encoding="utf-8")
     Path(args.out_comments).write_text(json.dumps(inline_comments, indent=2), encoding="utf-8")
