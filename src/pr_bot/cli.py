@@ -61,6 +61,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional output path to save current baseline snapshot JSON (--mode repo).",
     )
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=100_000,
+        help="Approximate token budget for Gemini review context (default: 100000).",
+    )
     args = parser.parse_args(argv)
 
     report: PRReviewReport | RepoReviewReport
@@ -119,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
                 project=args.vertex_project,
                 location=args.vertex_location,
                 model=args.gemini_model,
+                max_prompt_tokens=args.max_prompt_tokens,
             )
         except Exception as exc:
             logger.warning(

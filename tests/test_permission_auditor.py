@@ -465,3 +465,35 @@ def test_post_llm_false_claim_verification_and_guard_rejection(
     assert "### Claim Verification Gate" in verified
     assert verified.count("[UNVERIFIED CLAIM:") == 3
 
+
+def test_100k_token_budget_packs_more_than_five_hotspots_and_clones(tmp_path: Path) -> None:
+    """Default 100k-token review prompt includes >5 hotspots, clone clusters, and full-plan ask."""
+    for idx in range(8):
+        (tmp_path / f"mod_{idx}.py").write_text(
+            f"def complex_handler_{idx}(a: int, b: int) -> int:\n"
+            "    total = 0\n"
+            "    if a > 0:\n"
+            "        total += a\n"
+            "    if b > 0:\n"
+            "        total += b\n"
+            "    if a > b:\n"
+            "        total += 1\n"
+            "    return total\n",
+            encoding="utf-8",
+        )
+
+    report = analyze_repository(tmp_path, complexity_threshold=3)
+    assert len(report.hotspot_sources) == 8
+
+    prompt_100k = build_review_prompt(report)
+    for idx in range(8):
+        assert f"complex_handler_{idx}" in prompt_100k
+    assert "### Semantic Clone Clusters to Consolidate" in prompt_100k
+    assert "P0 Security" in prompt_100k
+    assert "not limited to 3 items" in prompt_100k
+
+    # Tight explicit token cap bounds prompt size gracefully without error
+    prompt_compact = build_review_prompt(report, max_prompt_tokens=600)
+    assert "### Deterministic Analysis Report" in prompt_compact
+    assert len(prompt_compact) < len(prompt_100k)
+

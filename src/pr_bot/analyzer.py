@@ -1259,12 +1259,12 @@ def analyze_repository(
             "line_start": h["line_start"],
             "complexity": h["complexity"],
             "callers": h["callers"],
-            "source_text": str(h["source_text"])[:4000],
+            "source_text": str(h["source_text"])[:8000],
             "connected_sources": _collect_connected_sources(
-                pipe, h["unit"], root, max_neighbors=3, max_chars=1200
+                pipe, h["unit"], root, max_neighbors=3, max_chars=1500
             ),
         }
-        for h in hotspot_candidates[:5]
+        for h in hotspot_candidates[:20]
     ]
     delta_summary = _compute_baseline_delta(hotspots, baseline_path)
 
@@ -1278,10 +1278,10 @@ def analyze_repository(
         degraded_units=int(summary.get("degraded_units", 0)),
         has_native_lowering=has_native_lowering,
         degraded_details=degraded_details,
-        hotspots=hotspots[:20],
+        hotspots=hotspots[:25],
         hotspot_sources=hotspot_sources,
-        clone_pairs=clone_pairs[:20],
-        clone_clusters=clone_clusters[:15],
+        clone_pairs=clone_pairs[:30],
+        clone_clusters=clone_clusters[:20],
         permission_inventory=perm_res.inventory,
         witness_paths=perm_res.witness_paths,
         candidate_helpers=perm_res.candidate_helpers,
