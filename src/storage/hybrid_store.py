@@ -131,6 +131,7 @@ class HybridCodeStore:
         self.unit_vectors: dict[str, dict[str, list[float]]] = {}
         self.graph: nx.MultiDiGraph[str] = nx.MultiDiGraph()
         self._point_ids: dict[str, str] = {}
+        self._symbol_summaries: dict[str, tuple[str, str]] = {}
         self._lock = threading.RLock()
 
         if self.storage_dir is not None:
@@ -973,6 +974,15 @@ class HybridCodeStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS symbol_summaries (
+                    content_hash TEXT PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    rationale TEXT NOT NULL
+                )
+                """
+            )
 
     def _save_snapshot(self, commit_sha: str, units: list[UnifiedCodeUnit]) -> None:
         if self._db_path is None:
@@ -996,4 +1006,36 @@ class HybridCodeStore:
                 conn.execute(
                     f"DELETE FROM tombstones WHERE unit_id IN ({placeholders})",
                     batch,
+                )
+
+    def get_symbol_summary(self, content_hash: str) -> tuple[str, str] | None:
+        """Retrieve a cached (role, rationale) classification for a function AST hash."""
+        with self._lock:
+            cached = self._symbol_summaries.get(content_hash)
+            if cached is not None:
+                return cached
+            if self._db_path is None or not self._db_path.exists():
+                return None
+            with self._connect_sqlite() as conn:
+                row = conn.execute(
+                    "SELECT role, rationale FROM symbol_summaries WHERE content_hash = ?",
+                    (content_hash,),
+                ).fetchone()
+                if row:
+                    val = (str(row[0]), str(row[1]))
+                    self._symbol_summaries[content_hash] = val
+                    return val
+            return None
+
+    def save_symbol_summary(self, content_hash: str, role: str, rationale: str) -> None:
+        """Persist a bottom-up LLM guard/sanitizer classification keyed by AST content hash."""
+        with self._lock:
+            self._symbol_summaries[content_hash] = (role, rationale)
+            if self._db_path is None:
+                return
+            with self._connect_sqlite() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO symbol_summaries "
+                    "(content_hash, role, rationale) VALUES (?, ?, ?)",
+                    (content_hash, role, rationale),
                 )

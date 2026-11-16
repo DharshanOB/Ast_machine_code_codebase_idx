@@ -33,6 +33,7 @@ class CPGEdgeKind(StrEnum):
     """Cross-file and intraprocedural Code Property Graph edge types."""
 
     CALLS = "CALLS"
+    FRAMEWORK_CALLS = "FRAMEWORK_CALLS"
     IMPLEMENTS = "IMPLEMENTS"
     REACHES = "REACHES"
     CFG_NEXT = "CFG_NEXT"

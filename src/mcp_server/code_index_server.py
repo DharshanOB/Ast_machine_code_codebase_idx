@@ -32,6 +32,7 @@ from indexer.models import (
     LLVMIRGraph,
     UnifiedCodeUnit,
 )
+from indexer.permission_auditor import audit_repository_permissions_and_security
 from indexer.python_bytecode import lower_python_file
 from indexer.semantic_cpg import SemanticCPGBuilder
 from storage.hybrid_store import HybridCodeStore
@@ -211,6 +212,13 @@ def _truncate_to_token_budget(
 
     if len(json.dumps(trimmed)) > max_chars and isinstance(trimmed.get("degraded_reason"), str):
         trimmed["degraded_reason"] = trimmed["degraded_reason"][:256]
+
+    for list_key in ("witness_paths", "permission_inventory", "findings"):
+        if len(json.dumps(trimmed)) > max_chars and isinstance(trimmed.get(list_key), list):
+            items = list(trimmed[list_key])
+            while items and len(json.dumps({**trimmed, list_key: items})) > max_chars:
+                items.pop()
+            trimmed[list_key] = items
 
     return trimmed
 
@@ -897,6 +905,48 @@ def get_index_health() -> dict[str, Any]:
             "cpg_symbols": len(pipe.cpg.symbols),
             "cpg_edges": pipe.cpg.graph.number_of_edges(),
         }
+
+
+@mcp.tool()
+def audit_permissions(repo_path: str) -> dict[str, Any]:
+    """Gather unwanted permissions, Guest escalations, and security checks across a repo."""
+    target = Path(repo_path).resolve()
+    if not _is_path_allowed(target):
+        raise ValueError(f"Repository path outside ASTRAEA_ALLOWED_ROOTS: {target}")
+    if not target.is_dir():
+        raise FileNotFoundError(f"Repository directory does not exist: {target}")
+    pipe = _get_pipeline()
+    pipe.index_workspace(target, incremental=True)
+    with pipe._lock:
+        scoped_units = []
+        cached_summaries: dict[str, tuple[str, str]] = {}
+        for unit in pipe.store.units.values():
+            try:
+                if Path(unit.ast_chunk.file_path).resolve().is_relative_to(target):
+                    scoped_units.append(unit)
+                    summary = pipe.store.get_symbol_summary(unit.ast_chunk.chunk_id)
+                    if summary is not None:
+                        cached_summaries[unit.ast_chunk.chunk_id] = summary
+            except OSError:
+                continue
+        audit_res = audit_repository_permissions_and_security(
+            target,
+            scoped_units,
+            pipe.cpg,
+            pipe.symbol_to_unit,
+            cached_summaries=cached_summaries,
+        )
+    return _truncate_to_token_budget(
+        {
+            "repo_path": str(target),
+            "total_findings": len(audit_res.findings),
+            "high_count": sum(1 for f in audit_res.findings if f.get("severity") == "HIGH"),
+            "medium_count": sum(1 for f in audit_res.findings if f.get("severity") == "MEDIUM"),
+            "witness_paths": audit_res.witness_paths,
+            "permission_inventory": audit_res.inventory,
+            "findings": audit_res.findings,
+        }
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

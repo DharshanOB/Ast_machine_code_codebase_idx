@@ -17,6 +17,7 @@ from indexer.models import IRStatus
 from indexer.semantic_cpg import SemanticCPGBuilder
 from mcp_server.code_index_server import (
     CodeIndexPipeline,
+    audit_permissions,
     find_ir_or_binary_clones,
     get_index_health,
     index_workspace,
@@ -155,7 +156,7 @@ def test_degraded_reason_sanitizes_compiler_source_echo(tmp_path: Path) -> None:
 
 
 def test_mcp_tools_registered() -> None:
-    """Verify all 6 MCP tools are registered on MCPServer."""
+    """Verify all 7 MCP tools are registered on MCPServer."""
     tool_names = {t.name for t in mcp._tool_manager.list_tools()}
     assert tool_names == {
         "index_workspace",
@@ -164,6 +165,7 @@ def test_mcp_tools_registered() -> None:
         "find_ir_or_binary_clones",
         "trace_symbol_dataflow",
         "get_index_health",
+        "audit_permissions",
     }
 
 
@@ -203,4 +205,8 @@ def test_mcp_tool_wrappers_end_to_end(tmp_path: Path, monkeypatch: pytest.Monkey
     assert health["consistent"] is True
     assert health["sqlite_ok"] is True
     assert health["cpg_symbols"] == 3
+
+    perm_audit = audit_permissions(str(ws))
+    assert perm_audit["repo_path"] == str(ws.resolve())
+    assert "permission_inventory" in perm_audit
     temp_pipe.store.close()

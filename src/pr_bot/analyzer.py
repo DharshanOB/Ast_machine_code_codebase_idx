@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from indexer.models import ASTChunkNode, CPGEdgeKind, IRStatus, Language, UnifiedCodeUnit
+from indexer.permission_auditor import audit_repository_permissions_and_security
 from mcp_server.code_index_server import CodeIndexPipeline
 from storage.hybrid_store import compute_wl_ir_vector, cosine_similarity
 
@@ -111,6 +112,135 @@ def _sanitize_md_inline(text: object) -> str:
     return raw.replace("`", "'").replace("|", "/").replace('"', "'")
 
 
+_SEVERITY_RANK: dict[str, int] = {"HIGH": 0, "MEDIUM": 1, "INFO": 2}
+
+
+def _sort_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
+    """Order findings by severity (`HIGH` -> `MEDIUM` -> `INFO`), then location."""
+    return sorted(
+        findings,
+        key=lambda f: (_SEVERITY_RANK.get(f.severity, 3), f.file_path, f.line, f.category),
+    )
+
+
+def _append_permission_inventory_markdown(
+    lines: list[str], inventory: list[dict[str, Any]]
+) -> None:
+    """Render gathered permission grants and bypasses across repository files."""
+    if not inventory:
+        return
+    ordered = sorted(
+        inventory,
+        key=lambda item: (
+            _SEVERITY_RANK.get(str(item.get("severity", "INFO")), 3),
+            str(item.get("file_path", "")),
+            int(item.get("line", 1)),
+        ),
+    )
+    high_or_med = sum(1 for i in ordered if i.get("severity") in ("HIGH", "MEDIUM"))
+    lines.extend(
+        [
+            f"### Permission & Privilege Inventory ({len(ordered)} total, {high_or_med} flagged)",
+            "",
+        ]
+    )
+    wrap_details = len(ordered) > 12 or high_or_med == 0
+    if wrap_details:
+        lines.extend(
+            ["<details>", f"<summary>Show {len(ordered)} permission entry/entries</summary>", ""]
+        )
+    lines.extend(
+        [
+            "| Severity | Scope | Permission | Location | Symbol | Notes |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+    )
+    for item in ordered[:50]:
+        sev = _sanitize_md_inline(item.get("severity", "INFO"))
+        scope = _sanitize_md_inline(item.get("role_or_scope", ""))
+        perm = _sanitize_md_inline(item.get("permission", ""))
+        loc = f"{_sanitize_md_inline(item.get('file_path', ''))}:{int(item.get('line', 1))}"
+        sym = _sanitize_md_inline(item.get("symbol_name", ""))
+        reason = _sanitize_md_inline(item.get("reason", ""))
+        lines.append(
+            f"| **{sev}** | {scope} | `{perm}` | `{loc}` | `{sym}` | {reason} |"
+        )
+    if wrap_details:
+        lines.extend(["", "</details>"])
+    lines.append("")
+
+
+def _append_witness_paths_markdown(
+    lines: list[str], witness_paths: list[dict[str, Any]]
+) -> None:
+    """Render compact Source->Sink witness spines for unsanitized privilege escalations."""
+    if not witness_paths:
+        return
+    lines.extend(["### Unsanitized Source-to-Sink Witness Paths", ""])
+    for wp in witness_paths[:15]:
+        steps = wp.get("steps") or []
+        chain = " -> ".join(
+            f"`{_sanitize_md_inline(s.get('file_path', ''))}:"
+            f"{_sanitize_md_inline(s.get('symbol_name', ''))}`"
+            + (
+                f" _({ _sanitize_md_inline(s.get('edge_kind', '')) })_"
+                if s.get("edge_kind") and s.get("edge_kind") != "SOURCE"
+                else ""
+            )
+            for s in steps
+        )
+        sinks_str = ", ".join(_sanitize_md_inline(s) for s in (wp.get("sinks") or []))
+        lines.append(
+            f"- **{int(wp.get('hops', 1))}-hop escalation** to `{sinks_str}`: {chain}"
+        )
+    lines.append("")
+
+
+def _append_findings_markdown(lines: list[str], findings: list[ReviewFinding]) -> None:
+    """Render findings grouped into a clean actionable table plus collapsible INFO section."""
+    if not findings:
+        return
+    ordered = _sort_findings(findings)
+    actionable = [f for f in ordered if f.severity in ("HIGH", "MEDIUM")]
+    info_only = [f for f in ordered if f.severity not in ("HIGH", "MEDIUM")]
+
+    lines.extend(["### Findings", ""])
+    if actionable:
+        lines.extend(
+            [
+                "| Severity | Category | Location | Symbol | Details |",
+                "| :--- | :--- | :--- | :--- | :--- |",
+            ]
+        )
+        for f in actionable[:50]:
+            loc = f"{_sanitize_md_inline(f.file_path)}:{f.line}"
+            lines.append(
+                f"| **{f.severity}** | `{_sanitize_md_inline(f.category)}` | `{loc}` | "
+                f"`{_sanitize_md_inline(f.symbol_name)}` | {_sanitize_md_inline(f.message)} |"
+            )
+        lines.append("")
+    else:
+        lines.extend(["No HIGH or MEDIUM issues detected.", ""])
+
+    if info_only:
+        lines.extend(
+            [
+                "<details>",
+                f"<summary>Informational Findings ({len(info_only)})</summary>",
+                "",
+            ]
+        )
+        for f in info_only[:40]:
+            safe_file = _sanitize_md_inline(f.file_path)
+            safe_sym = _sanitize_md_inline(f.symbol_name)
+            safe_msg = _sanitize_md_inline(f.message)
+            loc_str = f"`{safe_file}:{f.line}`" if safe_file else f"`{safe_sym}`"
+            lines.append(
+                f"- **[{f.severity}] {f.category}** ({loc_str} in `{safe_sym}`): {safe_msg}"
+            )
+        lines.extend(["", "</details>", ""])
+
+
 class ReviewFinding(BaseModel):
     """Actionable PR finding anchored to a file and line."""
 
@@ -149,18 +279,22 @@ class PRReviewReport(BaseModel):
     head_ref: str = "head"
     changed_functions: list[FunctionDelta] = Field(default_factory=list)
     connected_sources: list[dict[str, Any]] = Field(default_factory=list)
+    permission_inventory: list[dict[str, Any]] = Field(default_factory=list)
+    witness_paths: list[dict[str, Any]] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
 
     def to_markdown(self) -> str:
-        """Render a rich GitHub PR summary comment with compiler & CPG evidence."""
+        """Render a clean GitHub PR summary comment with compiler, CPG, and permission checks."""
         safe_base = _sanitize_md_inline(self.base_ref)
         safe_head = _sanitize_md_inline(self.head_ref)
+        high_n = sum(1 for f in self.findings if f.severity == "HIGH")
+        med_n = sum(1 for f in self.findings if f.severity == "MEDIUM")
         lines: list[str] = [
             "## Astraea 4-Layer PR Review (AST -> CPG -> LLVM IR -> Machine Code)",
             "",
             f"**Base:** `{safe_base}` | **Head:** `{safe_head}` | "
             f"**Modified Functions:** {len(self.changed_functions)} | "
-            f"**Findings:** {len(self.findings)}",
+            f"**HIGH:** {high_n} | **MEDIUM:** {med_n} | **Total Findings:** {len(self.findings)}",
             "",
         ]
         if self.changed_functions:
@@ -194,17 +328,9 @@ class PRReviewReport(BaseModel):
                 )
             lines.append("")
 
-        if self.findings:
-            lines.extend(["### Findings", ""])
-            for f in self.findings:
-                safe_f_file = _sanitize_md_inline(f.file_path)
-                safe_f_sym = _sanitize_md_inline(f.symbol_name)
-                safe_f_msg = _sanitize_md_inline(f.message)
-                lines.append(
-                    f"- **[{f.severity}] {f.category}** (`{safe_f_file}:{f.line}` "
-                    f"in `{safe_f_sym}`): {safe_f_msg}"
-                )
-            lines.append("")
+        _append_findings_markdown(lines, self.findings)
+        _append_witness_paths_markdown(lines, self.witness_paths)
+        _append_permission_inventory_markdown(lines, self.permission_inventory)
 
         callers_edges = [
             (_sanitize_md_inline(fn.symbol_name), _sanitize_md_inline(caller))
@@ -234,7 +360,7 @@ class PRReviewReport(BaseModel):
 
 
 class RepoReviewReport(BaseModel):
-    """Full-repository periodic health, complexity, clone, and blast-radius report."""
+    """Full-repository periodic health, complexity, clone, and permission audit report."""
 
     repo_path: str
     indexed_units: int
@@ -245,6 +371,9 @@ class RepoReviewReport(BaseModel):
     hotspot_sources: list[dict[str, Any]] = Field(default_factory=list)
     clone_pairs: list[dict[str, Any]] = Field(default_factory=list)
     clone_clusters: list[dict[str, Any]] = Field(default_factory=list)
+    permission_inventory: list[dict[str, Any]] = Field(default_factory=list)
+    witness_paths: list[dict[str, Any]] = Field(default_factory=list)
+    candidate_helpers: list[dict[str, Any]] = Field(default_factory=list)
     delta_summary: dict[str, Any] = Field(default_factory=dict)
     findings: list[ReviewFinding] = Field(default_factory=list)
 
@@ -259,20 +388,30 @@ class RepoReviewReport(BaseModel):
         }
 
     def to_markdown(self) -> str:
-        """Render a periodic repository health review in Markdown."""
+        """Render a clean, grouped repository health & security review in Markdown."""
         title = (
             "## Astraea Periodic 4-Layer Repository Review"
             if self.has_native_lowering
             else "## Astraea Periodic Repository Review"
         )
+        high_n = sum(1 for f in self.findings if f.severity == "HIGH")
+        med_n = sum(1 for f in self.findings if f.severity == "MEDIUM")
+        perm_flagged = sum(
+            1 for p in self.permission_inventory if p.get("severity") in ("HIGH", "MEDIUM")
+        )
         lines: list[str] = [
             title,
             "",
             f"**Indexed Units:** {self.indexed_units} | "
-            f"**Degraded Units:** {self.degraded_units} | "
-            f"**Findings:** {len(self.findings)}",
+            f"**Degraded:** {self.degraded_units} | "
+            f"**HIGH:** {high_n} | **MEDIUM:** {med_n} | "
+            f"**Permissions Flagged:** {perm_flagged}",
             "",
         ]
+        _append_findings_markdown(lines, self.findings)
+        _append_witness_paths_markdown(lines, self.witness_paths)
+        _append_permission_inventory_markdown(lines, self.permission_inventory)
+
         if self.delta_summary:
             lines.extend(["### Changes Since Last Run", ""])
             if "baseline_error" in self.delta_summary:
@@ -297,15 +436,6 @@ class RepoReviewReport(BaseModel):
                     )
             lines.append("")
 
-        if self.degraded_details:
-            lines.extend(["### Degraded Units", ""])
-            for d in self.degraded_details[:20]:
-                safe_d_file = _sanitize_md_inline(d["file_path"])
-                safe_d_sym = _sanitize_md_inline(d["symbol_name"])
-                safe_d_reason = _sanitize_md_inline(d["reason"])
-                lines.append(f"- `{safe_d_file}` (`{safe_d_sym}`): {safe_d_reason}")
-            lines.append("")
-
         if self.hotspots:
             lines.extend(
                 [
@@ -315,7 +445,7 @@ class RepoReviewReport(BaseModel):
                     "| :--- | :--- | :---: | :---: |",
                 ]
             )
-            for h in self.hotspots:
+            for h in self.hotspots[:15]:
                 safe_h_sym = _sanitize_md_inline(h["symbol_name"])
                 safe_h_file = _sanitize_md_inline(h["file_path"])
                 lines.append(
@@ -342,17 +472,23 @@ class RepoReviewReport(BaseModel):
                 lines.append(f"- `{safe_src}` ↔ `{safe_dst}` (similarity={c['similarity']:.3f})")
             lines.append("")
 
-        if self.findings:
-            lines.extend(["### Findings", ""])
-            for f in self.findings:
-                safe_f_file = _sanitize_md_inline(f.file_path)
-                safe_f_sym = _sanitize_md_inline(f.symbol_name)
-                safe_f_msg = _sanitize_md_inline(f.message)
-                lines.append(
-                    f"- **[{f.severity}] {f.category}** (`{safe_f_file}:{f.line}` "
-                    f"in `{safe_f_sym}`): {safe_f_msg}"
-                )
-            lines.append("")
+        if self.degraded_details:
+            shown = min(len(self.degraded_details), 20)
+            lines.extend(
+                [
+                    f"### Degraded Units ({len(self.degraded_details)})",
+                    "",
+                    "<details>",
+                    f"<summary>Show {shown} degraded unit(s)</summary>",
+                    "",
+                ]
+            )
+            for d in self.degraded_details[:20]:
+                safe_d_file = _sanitize_md_inline(d["file_path"])
+                safe_d_sym = _sanitize_md_inline(d["symbol_name"])
+                safe_d_reason = _sanitize_md_inline(d["reason"])
+                lines.append(f"- `{safe_d_file}` (`{safe_d_sym}`): {safe_d_reason}")
+            lines.extend(["", "</details>", ""])
         return "\n".join(lines)
 
 
@@ -674,11 +810,56 @@ def analyze_pr_directories(
                 )
             )
 
+    # Audit base vs head permissions & security risks so PR catches new Guest/bypass issues.
+    base_perm_res = audit_repository_permissions_and_security(
+        base_dir,
+        base_pipe.store.units.values(),
+        base_pipe.cpg,
+        base_pipe.symbol_to_unit,
+    )
+    head_perm_res = audit_repository_permissions_and_security(
+        head_dir,
+        head_pipe.store.units.values(),
+        head_pipe.cpg,
+        head_pipe.symbol_to_unit,
+    )
+    base_perm_keys = {
+        (f["category"], f["file_path"], f["symbol_name"], f["message"])
+        for f in base_perm_res.findings
+    }
+    pr_perm_inv = [
+        item
+        for item in head_perm_res.inventory
+        if item["file_path"] in changed_hunks or item.get("severity") == "HIGH"
+    ]
+    for item in head_perm_res.findings:
+        perm_key = (item["category"], item["file_path"], item["symbol_name"], item["message"])
+        is_new_escalation = item["category"] == "GUEST_PRIVILEGE_ESCALATION"
+        if (item["file_path"] in changed_hunks or is_new_escalation) and (
+            perm_key not in base_perm_keys
+        ):
+            findings.append(ReviewFinding(**item))
+
+    def _wp_sig(wp: dict[str, Any]) -> tuple[Any, Any, Any, Any]:
+        return (
+            wp.get("source_file"),
+            wp.get("source_symbol"),
+            wp.get("sink_file"),
+            wp.get("sink_symbol"),
+        )
+
+    base_wp_sigs = {_wp_sig(wp) for wp in base_perm_res.witness_paths}
+    pr_witness_paths = [
+        wp for wp in head_perm_res.witness_paths if _wp_sig(wp) not in base_wp_sigs
+    ]
+
     return PRReviewReport(
         base_ref=base_ref,
         head_ref=head_ref,
         changed_functions=deltas,
         connected_sources=pr_connected[:8],
+        permission_inventory=pr_perm_inv,
+        witness_paths=pr_witness_paths,
         findings=findings,
     )
 
@@ -1005,22 +1186,15 @@ def analyze_repository(
                 )
 
     clone_clusters = _cluster_clones(clone_pairs)
-    for cl in clone_clusters:
-        members_str = ", ".join(f"`{m}`" for m in cl["members"])
-        findings.append(
-            ReviewFinding(
-                severity="INFO",
-                category="CLONE_CLUSTER",
-                file_path="",
-                line=1,
-                symbol_name=cl["members"][0],
-                message=(
-                    f"{len(cl['members'])}-member semantic clone cluster "
-                    f"(similarity={cl['min_similarity']:.3f}–{cl['max_similarity']:.3f}): "
-                    f"{members_str}."
-                ),
-            )
-        )
+
+    perm_res = audit_repository_permissions_and_security(
+        root,
+        pipe.store.units.values(),
+        pipe.cpg,
+        pipe.symbol_to_unit,
+    )
+    for pf in perm_res.findings:
+        findings.append(ReviewFinding(**pf))
 
     hotspots.sort(key=lambda h: (int(h["complexity"]), int(h["callers"])), reverse=True)
     hotspot_candidates.sort(
@@ -1053,6 +1227,9 @@ def analyze_repository(
         hotspot_sources=hotspot_sources,
         clone_pairs=clone_pairs[:20],
         clone_clusters=clone_clusters[:15],
+        permission_inventory=perm_res.inventory,
+        witness_paths=perm_res.witness_paths,
+        candidate_helpers=perm_res.candidate_helpers,
         delta_summary=delta_summary,
         findings=findings,
     )

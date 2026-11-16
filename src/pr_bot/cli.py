@@ -131,7 +131,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if ai_review:
                 markdown = (
-                    f"{markdown}\n### Gemini Review ({args.gemini_model})\n\n{ai_review}\n"
+                    f"### Gemini Review ({args.gemini_model})\n\n"
+                    f"{ai_review}\n\n---\n\n{markdown}"
                 )
 
     Path(args.out_md).write_text(markdown, encoding="utf-8")
