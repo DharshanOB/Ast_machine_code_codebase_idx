@@ -282,6 +282,8 @@ class PRReviewReport(BaseModel):
     permission_inventory: list[dict[str, Any]] = Field(default_factory=list)
     witness_paths: list[dict[str, Any]] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
+    indexed_file_lines: dict[str, int] = Field(default_factory=dict, exclude=True)
+    indexed_symbols: set[str] = Field(default_factory=set, exclude=True)
 
     def to_markdown(self) -> str:
         """Render a clean GitHub PR summary comment with compiler, CPG, and permission checks."""
@@ -376,6 +378,8 @@ class RepoReviewReport(BaseModel):
     candidate_helpers: list[dict[str, Any]] = Field(default_factory=list)
     delta_summary: dict[str, Any] = Field(default_factory=dict)
     findings: list[ReviewFinding] = Field(default_factory=list)
+    indexed_file_lines: dict[str, int] = Field(default_factory=dict, exclude=True)
+    indexed_symbols: set[str] = Field(default_factory=set, exclude=True)
 
     def snapshot(self) -> dict[str, Any]:
         """Return a compact baseline snapshot for run-to-run diffing."""
@@ -577,6 +581,47 @@ def _index_units_by_key(
         key = base_key if idx == 0 else (rel, scope, f"{sym}#{idx}")
         mapping[key] = unit
     return mapping
+
+
+def _collect_ground_truth(
+    pipe: CodeIndexPipeline,
+    root: Path,
+    extra_items: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, int], set[str]]:
+    """Build exact file-line bounds and symbol names from indexed pipeline + audit items."""
+    file_lines: dict[str, int] = {}
+    symbols: set[str] = set()
+    abs_seen: dict[str, Path] = {}
+
+    for unit in pipe.store.units.values():
+        ast = unit.ast_chunk
+        rel = _rel_path(ast.file_path, root)
+        abs_seen.setdefault(rel, Path(ast.file_path))
+        file_lines[rel] = max(file_lines.get(rel, 1), ast.line_end)
+        if ast.symbol_name:
+            symbols.add(ast.symbol_name)
+
+    for item in extra_items or ():
+        rel = str(item.get("file_path", ""))
+        if rel:
+            line = int(item.get("line", 1))
+            file_lines[rel] = max(file_lines.get(rel, 1), line)
+            cand = (root / rel).resolve()
+            if cand.is_file():
+                abs_seen.setdefault(rel, cand)
+        sym = str(item.get("symbol_name", ""))
+        if sym:
+            symbols.add(sym)
+
+    for rel, fpath in abs_seen.items():
+        try:
+            n_lines = len(fpath.read_text(encoding="utf-8", errors="ignore").splitlines())
+            if n_lines > 0:
+                file_lines[rel] = max(file_lines.get(rel, 1), n_lines)
+        except OSError:
+            pass
+
+    return file_lines, symbols
 
 
 def _first_hunk_line(ast: ASTChunkNode, hunks: list[tuple[int, int]]) -> int:
@@ -853,6 +898,10 @@ def analyze_pr_directories(
         wp for wp in head_perm_res.witness_paths if _wp_sig(wp) not in base_wp_sigs
     ]
 
+    indexed_file_lines, indexed_symbols = _collect_ground_truth(
+        head_pipe, head_dir, pr_perm_inv + [f.model_dump() for f in findings]
+    )
+
     return PRReviewReport(
         base_ref=base_ref,
         head_ref=head_ref,
@@ -861,6 +910,8 @@ def analyze_pr_directories(
         permission_inventory=pr_perm_inv,
         witness_paths=pr_witness_paths,
         findings=findings,
+        indexed_file_lines=indexed_file_lines,
+        indexed_symbols=indexed_symbols,
     )
 
 
@@ -1217,6 +1268,10 @@ def analyze_repository(
     ]
     delta_summary = _compute_baseline_delta(hotspots, baseline_path)
 
+    indexed_file_lines, indexed_symbols = _collect_ground_truth(
+        pipe, root, perm_res.inventory + perm_res.findings
+    )
+
     return RepoReviewReport(
         repo_path=str(root),
         indexed_units=int(summary.get("indexed_units", 0)),
@@ -1232,4 +1287,6 @@ def analyze_repository(
         candidate_helpers=perm_res.candidate_helpers,
         delta_summary=delta_summary,
         findings=findings,
+        indexed_file_lines=indexed_file_lines,
+        indexed_symbols=indexed_symbols,
     )

@@ -360,6 +360,8 @@ class _HooksSpec:
     doc_events: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     override_whitelisted: dict[str, str] = field(default_factory=dict)
     override_doctype_class: dict[str, str] = field(default_factory=dict)
+    has_permission_dotted: set[str] = field(default_factory=set)
+    has_permission_symbols: set[str] = field(default_factory=set)
     hooked_dotted: set[str] = field(default_factory=set)
     hooked_symbols: set[str] = field(default_factory=set)
     findings: list[dict[str, Any]] = field(default_factory=list)
@@ -439,6 +441,10 @@ def _parse_frappe_hooks(root: Path) -> _HooksSpec:
                             dst_map[k_node.value.strip()] = v_node.value.strip()
 
                 if tgt.id in ("permission_query_conditions", "has_permission"):
+                    if tgt.id == "has_permission":
+                        for dotted in _extract_strings_from_ast(node.value):
+                            spec.has_permission_dotted.add(dotted)
+                            spec.has_permission_symbols.add(dotted.rsplit(".", 1)[-1])
                     spec.findings.append(
                         {
                             "severity": "INFO",
@@ -454,6 +460,227 @@ def _parse_frappe_hooks(root: Path) -> _HooksSpec:
                     )
 
     return spec
+
+
+_CLAIMED_AUTH_DOC_RE = re.compile(
+    r"\b(?:admin\s+only|requires?\s+(?:auth(?:entication)?|login|admin|role|permission)|"
+    r"authenticated\s+users?\s+only|must\s+be\s+logged\s+in|restricted\s+to\s+authorized)\b",
+    re.IGNORECASE,
+)
+_GUARD_NAME_PREFIXES: tuple[str, ...] = (
+    "verify_",
+    "check_perm",
+    "require_",
+    "authorize_",
+    "validate_perm",
+    "ensure_auth",
+)
+_AUTH_SIGNAL_TOKENS: tuple[str, ...] = (
+    "has_permission",
+    "only_for",
+    "check_permission",
+    "hmac",
+    "compare_digest",
+    "verify",
+    "signature",
+    "session",
+    "get_roles",
+    "token",
+    "secret",
+    "password",
+    "authorize",
+)
+_SANITIZER_SIGNAL_TOKENS: tuple[str, ...] = (
+    "isinstance",
+    "cint",
+    "flt",
+    "fullmatch",
+    "match",
+    "escape_html",
+    "strip_html",
+    "int",
+    "str",
+    "float",
+    "bool",
+)
+
+
+def _strip_docstring(stmts: list[ast.stmt]) -> list[ast.stmt]:
+    """Return function body statements excluding any leading string docstring."""
+    if (
+        stmts
+        and isinstance(stmts[0], ast.Expr)
+        and isinstance(stmts[0].value, ast.Constant)
+        and isinstance(stmts[0].value.value, str)
+    ):
+        return stmts[1:]
+    return stmts
+
+
+def _extract_fn_security_signals(
+    fn_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[str, bool]:
+    """Summarize AST enforcement, branching, and return behavior for a Python function."""
+    effective = _strip_docstring(list(fn_node.body))
+    returns = [n for n in ast.walk(fn_node) if isinstance(n, ast.Return)]
+    calls = [_call_dotted_name(n.func) for n in ast.walk(fn_node) if isinstance(n, ast.Call)]
+    has_if = any(isinstance(n, (ast.If, ast.IfExp)) for n in ast.walk(fn_node))
+    has_raise = any(isinstance(n, ast.Raise) for n in ast.walk(fn_node))
+    has_throw = any(
+        c.endswith((".throw", "abort", "sys.exit")) or c == "throw" for c in calls
+    )
+    only_true_return = bool(returns) and all(
+        isinstance(r.value, ast.Constant) and r.value.value is True for r in returns
+    )
+    top_level_true = any(
+        isinstance(s, ast.Return) and isinstance(s.value, ast.Constant) and s.value.value is True
+        for s in effective
+    )
+    top_level_noop = not effective or all(isinstance(s, ast.Pass) for s in effective)
+    src_dump = ast.dump(fn_node).lower()
+    has_auth_sig = any(tok in src_dump for tok in _AUTH_SIGNAL_TOKENS)
+    has_in_check = any(
+        isinstance(n, ast.Assert)
+        or (isinstance(n, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in n.ops))
+        for n in ast.walk(fn_node)
+    )
+    has_sanitizer_sig = has_in_check or any(
+        c.rsplit(".", 1)[-1] in _SANITIZER_SIGNAL_TOKENS for c in calls
+    )
+    return {
+        "is_noop": top_level_noop,
+        "only_true_return": only_true_return,
+        "unconditional_true": top_level_true,
+        "has_if": has_if,
+        "has_rejection": has_raise or has_throw,
+        "has_auth_signal": has_auth_sig,
+        "has_sanitizer_signal": has_sanitizer_sig,
+    }
+
+
+def verify_helper_classification_ast(source_text: str, claimed_role: str) -> tuple[bool, str]:
+    """Deterministically verify whether an LLM `AUTH_GUARD`/`SANITIZER` label matches the AST."""
+    role = claimed_role.upper()
+    if role not in ("AUTH_GUARD", "SANITIZER"):
+        return True, ""
+    try:
+        tree = ast.parse(textwrap.dedent(source_text))
+    except SyntaxError:
+        return True, ""
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if not fns:
+        return False, "No function definition found to substantiate security role."
+    sig = _extract_fn_security_signals(fns[0])
+
+    if role == "AUTH_GUARD":
+        if sig["is_noop"] or sig["only_true_return"] or sig["unconditional_true"]:
+            return False, "Function is a no-op or unconditionally returns True."
+        if not (sig["has_if"] or sig["has_rejection"] or sig["has_auth_signal"]):
+            return False, "No branching check, exception/throw, or auth signal found in AST."
+    elif role == "SANITIZER":
+        if sig["is_noop"] or sig["only_true_return"]:
+            return False, "Function is a no-op or unconditionally returns True."
+        if not (sig["has_sanitizer_signal"] or sig["has_rejection"]):
+            return False, "No type guard, pattern check, or rejection path found in AST."
+    return True, ""
+
+
+def _detect_false_security_claims(
+    chunk: ASTChunkNode,
+    rel_file: str,
+    hooks_spec: _HooksSpec,
+    has_auth_guard: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """Detect misleading/no-op auth guards, fake `has_permission` hooks, and doc contradictions."""
+    findings: list[dict[str, Any]] = []
+    inventory: list[dict[str, Any]] = []
+    is_fake_guard = False
+
+    if chunk.language != Language.PYTHON:
+        return findings, inventory, False
+    try:
+        tree = ast.parse(textwrap.dedent(chunk.source_text))
+    except SyntaxError:
+        return findings, inventory, False
+
+    fns = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if not fns:
+        return findings, inventory, False
+    top_fn = fns[0]
+    sym = chunk.symbol_name or top_fn.name
+    _, allow_guest = _whitelist_decorator_info(top_fn)
+    sig = _extract_fn_security_signals(top_fn)
+
+    is_perm_hook = (
+        top_fn.name in hooks_spec.has_permission_symbols
+        or any(d.endswith(f".{top_fn.name}") for d in hooks_spec.has_permission_dotted)
+    )
+    looks_like_guard = top_fn.name.startswith(_GUARD_NAME_PREFIXES) or is_perm_hook
+
+    if looks_like_guard and (
+        sig["is_noop"] or sig["only_true_return"] or sig["unconditional_true"]
+    ):
+        is_fake_guard = True
+        hook_note = " (`has_permission` hook)" if is_perm_hook else ""
+        msg = (
+            f"Security helper `{sym}`{hook_note} is a no-op or unconditionally returns True "
+            "without enforcing authorization checks."
+        )
+        findings.append(
+            {
+                "severity": "HIGH",
+                "category": "FALSE_SECURITY_CLAIM",
+                "file_path": rel_file,
+                "line": chunk.line_start,
+                "symbol_name": sym,
+                "message": msg,
+            }
+        )
+        inventory.append(
+            {
+                "file_path": rel_file,
+                "line": chunk.line_start,
+                "symbol_name": sym,
+                "role_or_scope": "False Security Claim",
+                "permission": "No-op / always-True guard",
+                "severity": "HIGH",
+                "reason": msg,
+            }
+        )
+    elif looks_like_guard and not (sig["has_if"] or sig["has_rejection"] or sig["has_auth_signal"]):
+        is_fake_guard = True
+        msg = (
+            f"Function `{sym}` claims authorization/verification by name but performs "
+            "no conditional check, exception raise, or auth check."
+        )
+        findings.append(
+            {
+                "severity": "MEDIUM",
+                "category": "FALSE_SECURITY_CLAIM",
+                "file_path": rel_file,
+                "line": chunk.line_start,
+                "symbol_name": sym,
+                "message": msg,
+            }
+        )
+
+    if allow_guest and not has_auth_guard and _CLAIMED_AUTH_DOC_RE.search(chunk.source_text):
+        msg = (
+            f"Endpoint `{sym}` claims restricted/authenticated access in comments or docstring "
+            "but declares `@frappe.whitelist(allow_guest=True)` with no auth guard."
+        )
+        findings.append(
+            {
+                "severity": "HIGH",
+                "category": "FALSE_SECURITY_CLAIM",
+                "file_path": rel_file,
+                "line": chunk.line_start,
+                "symbol_name": sym,
+                "message": msg,
+            }
+        )
+
+    return findings, inventory, is_fake_guard
 
 
 def _inspect_python_chunk(
@@ -1378,6 +1605,8 @@ def audit_repository_permissions_and_security(
     guest_units: list[tuple[UnifiedCodeUnit, str, bool]] = []
     unit_sinks_by_uid: dict[str, list[str]] = {}
     guard_uris: set[str] = set()
+    fake_guard_uris: set[str] = set()
+    fake_guard_names: set[str] = set()
     whitelisted_uids: set[str] = set()
 
     for unit in unit_list:
@@ -1391,16 +1620,26 @@ def audit_repository_permissions_and_security(
             u_findings, u_inv, is_guest, has_guard, is_wl, sinks = _inspect_python_chunk(
                 ast_chunk, rel_file
             )
+            fc_findings, fc_inv, is_fake_guard = _detect_false_security_claims(
+                ast_chunk, rel_file, hooks_spec, has_guard
+            )
             findings.extend(u_findings)
+            findings.extend(fc_findings)
             inventory.extend(u_inv)
-            if has_guard and unit.scip_symbol is not None:
+            inventory.extend(fc_inv)
+            if is_fake_guard:
+                if ast_chunk.symbol_name:
+                    fake_guard_names.add(ast_chunk.symbol_name)
+                if unit.scip_symbol is not None:
+                    fake_guard_uris.add(unit.scip_symbol.symbol_uri)
+            elif has_guard and unit.scip_symbol is not None:
                 guard_uris.add(unit.scip_symbol.symbol_uri)
             if is_wl:
                 whitelisted_uids.add(unit.unit_id)
             if sinks:
                 unit_sinks_by_uid[unit.unit_id] = sinks
             if is_guest:
-                guest_units.append((unit, rel_file, has_guard))
+                guest_units.append((unit, rel_file, has_guard and not is_fake_guard))
         elif ast_chunk.language in (Language.C, Language.CPP):
             for m in _CPP_DANGEROUS_CALL_RE.finditer(ast_chunk.source_text):
                 line_no = ast_chunk.line_start + ast_chunk.source_text[: m.start()].count("\n")
@@ -1427,6 +1666,19 @@ def audit_repository_permissions_and_security(
                         "message": f"Unsafe JavaScript sink `{m.group(0).strip()}`.",
                     }
                 )
+
+    guard_uris -= fake_guard_uris
+    if fake_guard_names:
+        guest_units = [
+            (
+                u,
+                rf,
+                False
+                if hg and any(fn in u.ast_chunk.source_text for fn in fake_guard_names)
+                else hg,
+            )
+            for u, rf, hg in guest_units
+        ]
 
     escalations, witness_paths, candidate_helpers = _trace_witness_paths(
         guest_units=guest_units,

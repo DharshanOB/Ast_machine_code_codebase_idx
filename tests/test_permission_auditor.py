@@ -12,7 +12,11 @@ from indexer.permission_auditor import audit_repository_permissions_and_security
 from mcp_server.code_index_server import CodeIndexPipeline
 from pr_bot.analyzer import analyze_pr_directories, analyze_repository
 from pr_bot.cli import main as cli_main
-from pr_bot.gemini_reviewer import build_review_prompt, classify_custom_guard_helpers
+from pr_bot.gemini_reviewer import (
+    build_review_prompt,
+    classify_custom_guard_helpers,
+    verify_review_claims,
+)
 
 
 def test_frappe_doctype_guest_and_all_permissions_flagged(tmp_path: Path) -> None:
@@ -340,4 +344,124 @@ def test_cached_bottom_up_guard_summary_prunes_witness_path(
     )
     assert res2.witness_paths == []
     pipe.store.close()
+
+
+def test_false_security_claims_detected_in_source_and_hooks(tmp_path: Path) -> None:
+    """No-op verify_* guards, always-True has_permission hooks, and guest doc contradictions."""
+    app = tmp_path / "billing_app"
+    app.mkdir()
+    (app / "hooks.py").write_text(
+        'has_permission = {"Invoice": "billing_app.perms.always_allow_perm"}\n',
+        encoding="utf-8",
+    )
+    (app / "perms.py").write_text(
+        "def always_allow_perm(doc, ptype, user) -> bool:\n"
+        "    return True\n\n"
+        "def verify_webhook_signature(sig: str) -> bool:\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    (app / "api.py").write_text(
+        "from billing_app.perms import verify_webhook_signature\n\n"
+        "@frappe.whitelist(allow_guest=True)\n"
+        "def guest_pay(order_id: str, sig: str) -> None:\n"
+        '    """Admin only endpoint requiring authentication."""\n'
+        "    verify_webhook_signature(sig)\n"
+        "    frappe.db.set_value('Order', order_id, 'status', 'Paid')\n",
+        encoding="utf-8",
+    )
+
+    report = analyze_repository(tmp_path)
+    false_claims = [f for f in report.findings if f.category == "FALSE_SECURITY_CLAIM"]
+    flagged_syms = {f.symbol_name for f in false_claims}
+    assert "always_allow_perm" in flagged_syms
+    assert "verify_webhook_signature" in flagged_syms
+    assert "guest_pay" in flagged_syms
+    # Calling the fake verify_webhook_signature guard must NOT hide the Guest escalation
+    assert any(
+        f.category == "GUEST_PERMISSION" and f.symbol_name == "guest_pay"
+        for f in report.findings
+    )
+
+
+def test_post_llm_false_claim_verification_and_guard_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage-4 AST guard check rejects fake LLM AUTH_GUARD; post-LLM gate flags hallucinations."""
+    from google import genai
+
+    base = tmp_path / "base"
+    head = tmp_path / "head"
+    base.mkdir()
+    head.mkdir()
+    (base / "api.py").write_text(
+        "def public_write(doc_name: str) -> None:\n    pass\n",
+        encoding="utf-8",
+    )
+    (head / "api.py").write_text(
+        "@frappe.whitelist(allow_guest=True)\n"
+        "def public_write(doc_name: str) -> None:\n"
+        "    return frappe.db.set_value('Order', doc_name, 'status', 'Paid')\n",
+        encoding="utf-8",
+    )
+    diff = (
+        "diff --git a/api.py b/api.py\n--- a/api.py\n+++ b/api.py\n@@ -1,2 +1,3 @@\n"
+    )
+    pr_report = analyze_pr_directories(base, head, diff_text=diff)
+
+    # 1. Stage-4 guard verification rejects hallucinated AUTH_GUARD on a pass-through helper
+    class _FakeModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            return type(
+                "Resp",
+                (),
+                {"text": '{"role": "AUTH_GUARD", "rationale": "validates caller token"}'},
+            )()
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.models = _FakeModels()
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    verdicts = classify_custom_guard_helpers(
+        [
+            {
+                "content_hash": "abc123",
+                "symbol_name": "passthrough_write",
+                "source_text": (
+                    "def passthrough_write(doc_name: str) -> None:\n"
+                    "    return frappe.db.set_value('Order', doc_name, 'status', 'Paid')\n"
+                ),
+            }
+        ]
+    )
+    role, rationale = verdicts["abc123"]
+    assert role == "NEUTRAL"
+    assert "Rejected false AUTH_GUARD claim" in rationale
+
+    # 2. Grounded review passes without false claims
+    clean_text, clean_claims = verify_review_claims(
+        "1. `api.py:1` exposes `public_write` to Guest without authorization.", pr_report
+    )
+    assert clean_claims == []
+    assert "[UNVERIFIED CLAIM" not in clean_text
+
+    # 3. Hallucinated review is caught across missing file, bad line, missing sym, NFC, and safety
+    hallucinated = (
+        "1. `ghost_module.py:42` leaks tokens.\n"
+        "2. `api.py:999` calls `phantom_guard()` cleanly.\n"
+        "3. `public_write` is NFC Verified with no security issues."
+    )
+    verified, detected = verify_review_claims(hallucinated, pr_report)
+    claim_types = {c["type"] for c in detected}
+    assert {
+        "MISSING_FILE",
+        "OUT_OF_RANGE_LINE",
+        "UNKNOWN_SYMBOL",
+        "NFC_CONTRADICTION",
+        "SAFETY_CONTRADICTION",
+    }.issubset(claim_types)
+    assert "### Claim Verification Gate" in verified
+    assert verified.count("[UNVERIFIED CLAIM:") == 3
 

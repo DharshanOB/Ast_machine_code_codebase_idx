@@ -17,7 +17,7 @@ from pr_bot.analyzer import (
     resolve_merge_base,
     validate_git_ref,
 )
-from pr_bot.gemini_reviewer import generate_vertex_gemini_review
+from pr_bot.gemini_reviewer import generate_vertex_gemini_review, verify_review_claims
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +130,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             if ai_review:
+                verified_review, _ = verify_review_claims(ai_review, report)
                 markdown = (
                     f"### Gemini Review ({args.gemini_model})\n\n"
-                    f"{ai_review}\n\n---\n\n{markdown}"
+                    f"{verified_review}\n\n---\n\n{markdown}"
                 )
 
     Path(args.out_md).write_text(markdown, encoding="utf-8")

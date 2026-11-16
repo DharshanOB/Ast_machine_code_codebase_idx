@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
+from indexer.permission_auditor import verify_helper_classification_ast
 from pr_bot.analyzer import PRReviewReport, RepoReviewReport, _sanitize_md_inline
 
 _UNTRUSTED_DATA_RULE = (
@@ -264,10 +266,198 @@ def classify_custom_guard_helpers(
             rationale = str(parsed.get("rationale", ""))[:200]
         except (ValueError, TypeError):
             role = "NEUTRAL"
+        ok, reject_reason = verify_helper_classification_ast(src, role)
+        if not ok:
+            false_role = role
+            role = "NEUTRAL"
+            rationale = f"[Rejected false {false_role} claim: {reject_reason}] {rationale}".strip()[
+                :240
+            ]
         out[chash] = (role, rationale)
         if store is not None:
             store.save_symbol_summary(chash, role, rationale)
     return out
+
+
+_FILE_LINE_CITE_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])"
+    r"([A-Za-z0-9_./-]+\.(?:py|js|ts|tsx|c|cc|cpp|cxx|h|hpp|rs|json|yml|yaml)):(\d+)\b"
+)
+_CALL_CITE_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)\(\)`")
+_STDLIB_OR_FRAMEWORK_CALLS: frozenset[str] = frozenset(
+    {"print", "len", "int", "str", "float", "bool", "dict", "list", "set", "tuple", "isinstance"}
+)
+_NFC_CLAIM_RE = re.compile(
+    r"\b(?:nfc\s+verified|no\s+behavioral\s+change|semantically\s+equivalent|identical\s+ir)\b",
+    re.IGNORECASE,
+)
+_SAFETY_CLAIM_RE = re.compile(
+    r"\b(?:no\s+(?:security|permission)\s+(?:issues?|vulnerabilit(?:y|ies)|risks?)|"
+    r"no\s+guest\s+permissions?|safe\s+for\s+guest|properly\s+(?:protected|authorized|guarded))\b",
+    re.IGNORECASE,
+)
+
+
+def _match_cited_file(cited_file: str, known_files: dict[str, int]) -> str | None:
+    """Resolve a cited relative path against indexed files (exact match or unique suffix)."""
+    if cited_file in known_files:
+        return cited_file
+    suffix_matches = [k for k in known_files if k.endswith(f"/{cited_file}")]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+def verify_review_claims(
+    review_text: str,
+    report: PRReviewReport | RepoReviewReport,
+) -> tuple[str, list[dict[str, str]]]:
+    """Post-LLM false-claim gate verifying file/line citations and safety/NFC claims."""
+    if not review_text.strip():
+        return review_text, []
+
+    known_files: dict[str, int] = dict(getattr(report, "indexed_file_lines", {}) or {})
+    known_symbols: set[str] = set(getattr(report, "indexed_symbols", set()) or set())
+
+    for fn in getattr(report, "changed_functions", []) or []:
+        if fn.file_path:
+            known_files[fn.file_path] = max(known_files.get(fn.file_path, 1), fn.line_end)
+        if fn.symbol_name:
+            known_symbols.add(fn.symbol_name)
+    for f in getattr(report, "findings", []) or []:
+        if f.file_path:
+            known_files[f.file_path] = max(known_files.get(f.file_path, 1), f.line)
+        if f.symbol_name:
+            known_symbols.add(f.symbol_name)
+    for item in getattr(report, "permission_inventory", []) or []:
+        rf = str(item.get("file_path", ""))
+        if rf:
+            known_files[rf] = max(known_files.get(rf, 1), int(item.get("line", 1)))
+        sym = str(item.get("symbol_name", ""))
+        if sym:
+            known_symbols.add(sym)
+
+    non_nfc_syms = {
+        fn.symbol_name
+        for fn in (getattr(report, "changed_functions", []) or [])
+        if not fn.nfc_verified and fn.symbol_name
+    }
+    nfc_syms = {
+        fn.symbol_name
+        for fn in (getattr(report, "changed_functions", []) or [])
+        if fn.nfc_verified and fn.symbol_name
+    }
+    high_risk_cats = {
+        "GUEST_PERMISSION",
+        "GUEST_PRIVILEGE_ESCALATION",
+        "FALSE_SECURITY_CLAIM",
+        "PERMISSION_BYPASS",
+        "SQL_INJECTION",
+        "PRIVILEGE_ESCALATION",
+        "SECURITY_RISK",
+    }
+    has_security_risks = bool(getattr(report, "witness_paths", [])) or any(
+        f.severity in ("HIGH", "MEDIUM") and f.category in high_risk_cats
+        for f in (getattr(report, "findings", []) or [])
+    )
+
+    claims: list[dict[str, str]] = []
+    out_lines: list[str] = []
+    in_fence = False
+
+    for line in review_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        if in_fence:
+            out_lines.append(line)
+            continue
+
+        line_reasons: list[str] = []
+        cited_pairs = _FILE_LINE_CITE_RE.findall(line) if known_files else []
+        if cited_pairs:
+            for cited_file, line_str in cited_pairs:
+                line_num = int(line_str)
+                matched = _match_cited_file(cited_file, known_files)
+                if matched is None:
+                    reason = f"Referenced file `{cited_file}:{line_num}` does not exist in index."
+                    claims.append(
+                        {
+                            "type": "MISSING_FILE",
+                            "target": f"{cited_file}:{line_num}",
+                            "reason": reason,
+                        }
+                    )
+                    line_reasons.append(f"`{cited_file}` not in repo")
+                else:
+                    max_l = known_files[matched]
+                    if line_num < 1 or line_num > max_l:
+                        reason = (
+                            f"Cited line `{cited_file}:{line_num}` exceeds file length ({max_l})."
+                        )
+                        claims.append(
+                            {
+                                "type": "OUT_OF_RANGE_LINE",
+                                "target": f"{cited_file}:{line_num}",
+                                "reason": reason,
+                            }
+                        )
+                        line_reasons.append(f"line {line_num} > {max_l} in `{cited_file}`")
+
+        if cited_pairs and known_symbols:
+            for cited_sym in _CALL_CITE_RE.findall(line):
+                if (
+                    "_" in cited_sym
+                    and cited_sym not in known_symbols
+                    and cited_sym not in _STDLIB_OR_FRAMEWORK_CALLS
+                ):
+                    reason = f"Cited function `{cited_sym}()` does not exist in indexed symbols."
+                    claims.append(
+                        {"type": "UNKNOWN_SYMBOL", "target": cited_sym, "reason": reason}
+                    )
+                    line_reasons.append(f"`{cited_sym}()` not indexed")
+
+        if _NFC_CLAIM_RE.search(line) and non_nfc_syms:
+            mentioned_non_nfc = [
+                s for s in non_nfc_syms if re.search(rf"\b{re.escape(s)}\b", line)
+            ]
+            if mentioned_non_nfc or not nfc_syms:
+                tgt = ", ".join(sorted(mentioned_non_nfc or non_nfc_syms)[:3])
+                reason = f"Claims NFC/no behavioral change while `{tgt}` has IR/lowering drift."
+                claims.append({"type": "NFC_CONTRADICTION", "target": tgt, "reason": reason})
+                line_reasons.append(f"contradicts non-NFC `{tgt}`")
+
+        if _SAFETY_CLAIM_RE.search(line) and has_security_risks:
+            reason = (
+                "Claims no security/guest issues despite deterministic HIGH/witness findings."
+            )
+            claims.append({"type": "SAFETY_CONTRADICTION", "target": "security", "reason": reason})
+            line_reasons.append("contradicts deterministic security/witness findings")
+
+        if line_reasons:
+            note = "; ".join(dict.fromkeys(line_reasons))
+            out_lines.append(f"{line} **[UNVERIFIED CLAIM: {note}]**")
+        else:
+            out_lines.append(line)
+
+    if not claims:
+        return review_text, []
+
+    summary_lines = [
+        "",
+        "### Claim Verification Gate",
+        "",
+        "| Claim Type | Target | Reason |",
+        "| :--- | :--- | :--- |",
+    ]
+    for c in claims[:15]:
+        summary_lines.append(
+            f"| `{_sanitize_md_inline(c['type'])}` | `{_sanitize_md_inline(c['target'])}` | "
+            f"{_sanitize_md_inline(c['reason'])} |"
+        )
+    return "\n".join(out_lines + summary_lines), claims
 
 
 def generate_vertex_gemini_review(
