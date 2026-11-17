@@ -626,35 +626,6 @@ class HybridCodeStore:
                 points_selector=PointIdsList(points=stray_qdrant_ids),
             )
 
-    def save_file_state(self, updates: dict[str, tuple[str, list[str]]]) -> None:
-        """Persist per-file content hashes and indexed unit IDs in SQLite."""
-        with self._lock:
-            if self._db_path is None or not updates:
-                return
-            rows = [
-                (file_path, content_hash, json.dumps(unit_ids))
-                for file_path, (content_hash, unit_ids) in updates.items()
-            ]
-            with self._connect_sqlite() as conn:
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO file_state (file_path, content_hash, unit_ids_json)
-                    VALUES (?, ?, ?)
-                    """,
-                    rows,
-                )
-
-    def delete_file_state(self, file_paths: list[str]) -> None:
-        """Remove persisted file state entries for deleted files."""
-        with self._lock:
-            if self._db_path is None or not file_paths:
-                return
-            with self._connect_sqlite() as conn:
-                conn.executemany(
-                    "DELETE FROM file_state WHERE file_path = ?",
-                    [(fp,) for fp in file_paths],
-                )
-
     def load_file_state(self) -> dict[str, tuple[str, list[str]]]:
         """Load persisted per-file content hashes and unit IDs from SQLite."""
         with self._lock:

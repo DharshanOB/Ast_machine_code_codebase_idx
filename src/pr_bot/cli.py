@@ -138,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if ai_review:
                 verified_review, _ = verify_review_claims(ai_review, report)
+                markdown = report.to_markdown()
                 markdown = (
                     f"### Gemini Review ({args.gemini_model})\n\n"
                     f"{verified_review}\n\n---\n\n{markdown}"

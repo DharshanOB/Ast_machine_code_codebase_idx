@@ -20,11 +20,14 @@ from indexer.python_bytecode import lower_python_file
 
 
 def test_sec01_sanitize_compile_flags() -> None:
-    """SEC-01: Strip -fplugin, @response_file, and arbitrary flags while keeping safe ones."""
+    """SEC-01: Strip -fplugin, @response_file (standalone or attached), and dash-prefixed args."""
     raw = [
         "-O3",
         "-fplugin=/tmp/evil.so",
         "@/tmp/args.rsp",
+        "-I@/etc/passwd",
+        "-I",
+        "-Xclang",
         "-I",
         "/usr/include/custom",
         "-isystem/opt/sys",
@@ -34,6 +37,8 @@ def test_sec01_sanitize_compile_flags() -> None:
         "-std=c17",
         "-Xclang",
         "-load",
+        "-mllvm",
+        "-asan-instrument-reads",
     ]
     safe = sanitize_compile_flags(raw)
     assert safe == [
@@ -46,7 +51,7 @@ def test_sec01_sanitize_compile_flags() -> None:
         "-std=c17",
     ]
     assert all("-fplugin" not in f for f in safe)
-    assert all(not f.startswith("@") for f in safe)
+    assert all("@" not in f for f in safe)
 
 
 def test_g01_llvm_ir_clamp_convergence_and_g02_strength_reduction() -> None:
@@ -487,3 +492,37 @@ def test_python_bytecode_basic_block_splitting_and_successors(tmp_path: Path) ->
     b_first = blocks_by_fn["first_fn"]
     assert len(b_first) >= 2
     assert any(len(b.successor_vas) >= 1 for b in b_first)
+
+
+def test_python_bytecode_short_circuit_jump_preserves_fallthrough(tmp_path: Path) -> None:
+    """Short-circuit boolean expressions must retain two outgoing successors on conditional BBs."""
+    py_file = tmp_path / "logic.py"
+    py_file.write_text(
+        "def pick_val(a: int, b: int) -> int:\n"
+        "    return a or b\n",
+        encoding="utf-8",
+    )
+    _, bb_map = lower_python_file(py_file)
+    blocks = bb_map["pick_val"]
+    if len(blocks) > 1:
+        assert len(blocks[0].successor_vas) == 2
+
+
+def test_llvm_ir_pass_import_creates_no_build_tmp_dir(tmp_path: Path) -> None:
+    """Importing indexer.llvm_ir_pass must not eagerly create astraea-build-* temp dirs."""
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["TMPDIR"] = str(tmp_path)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    proc = subprocess.run(
+        [sys.executable, "-c", "import indexer.llvm_ir_pass"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.returncode == 0
+    assert list(tmp_path.glob("astraea-build-*")) == []

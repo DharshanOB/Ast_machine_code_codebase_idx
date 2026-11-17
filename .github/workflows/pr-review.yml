@@ -88,16 +88,70 @@ jobs:
           HEAD_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           REPO: ${{ github.repository }}
         run: |
-          gh pr comment "$PR_NUMBER" --body-file pr_review_summary.md
           python3 - <<'EOF'
           import json, os, subprocess, sys
+          repo = os.environ["REPO"]
+          pr_num = os.environ["PR_NUMBER"]
+          marker = "<!-- astraea-pr-review -->"
+          with open("pr_review_summary.md", encoding="utf-8") as fh:
+              summary_body = fh.read()
+          if marker not in summary_body:
+              summary_body = f"{marker}\n{summary_body}"
+
+          existing_id = None
+          list_proc = subprocess.run(
+              [
+                  "gh",
+                  "api",
+                  "--paginate",
+                  f"repos/{repo}/issues/{pr_num}/comments?per_page=100",
+                  "--jq",
+                  f'.[] | select((.body // "") | contains("{marker}")) | .id',
+              ],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          if list_proc.returncode == 0 and list_proc.stdout.strip():
+              existing_id = list_proc.stdout.strip().splitlines()[0]
+
+          payload = json.dumps({"body": summary_body})
+          if existing_id is not None:
+              subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--method",
+                      "PATCH",
+                      f"repos/{repo}/issues/comments/{existing_id}",
+                      "--input",
+                      "-",
+                  ],
+                  input=payload,
+                  text=True,
+                  check=True,
+              )
+          else:
+              subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      f"repos/{repo}/issues/{pr_num}/comments",
+                      "--input",
+                      "-",
+                  ],
+                  input=payload,
+                  text=True,
+                  check=True,
+              )
+
           with open("pr_review_comments.json", encoding="utf-8") as fh:
               comments = json.load(fh)
           failed = 0
           for c in comments[:15]:
               proc = subprocess.run([
                   "gh", "api",
-                  f"repos/{os.environ['REPO']}/pulls/{os.environ['PR_NUMBER']}/comments",
+                  f"repos/{repo}/pulls/{pr_num}/comments",
                   "-f", f"body={c['body']}",
                   "-f", f"commit_id={os.environ.get('HEAD_COMMIT_SHA', '')}",
                   "-f", f"path={c['path']}",

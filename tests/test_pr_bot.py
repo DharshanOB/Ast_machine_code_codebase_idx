@@ -564,3 +564,18 @@ def test_cli_pr_mode_end_to_end(tmp_path: Path) -> None:
     assert out_md.exists()
     assert "scale" in out_md.read_text(encoding="utf-8")
     assert out_comments.exists()
+
+
+def test_clone_clusters_include_avg_similarity_in_prompt(tmp_path: Path) -> None:
+    """Clone clusters in build_review_prompt must report non-zero avg_similarity."""
+    for idx in (1, 2):
+        (tmp_path / f"dup_{idx}.py").write_text(
+            f"def compute_clone_{idx}(a: int, b: int) -> int:\n"
+            "    if a > 0:\n        return a + b\n    return b\n",
+            encoding="utf-8",
+        )
+    report = analyze_repository(tmp_path, clone_threshold=0.80)
+    assert len(report.clone_clusters) >= 1
+    assert report.clone_clusters[0].get("avg_similarity", 0.0) >= 0.80
+    prompt = build_review_prompt(report)
+    assert "avg similarity 0.000" not in prompt

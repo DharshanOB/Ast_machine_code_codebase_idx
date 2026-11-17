@@ -22,7 +22,7 @@ from mcp.server.mcpserver import MCPServer
 from indexer.ast_chunker import MAX_FILE_BYTES, ASTChunker, detect_language, is_header_file
 from indexer.binary_lifter import BinaryLifter
 from indexer.dwarf_aligner import DWARFAligner
-from indexer.llvm_ir_pass import BUILD_TMP_ROOT, LLVMIRPass, extract_leaf_symbol_name
+from indexer.llvm_ir_pass import LLVMIRPass, extract_leaf_symbol_name, get_build_tmp_root
 from indexer.models import (
     ASTChunkNode,
     BinaryBasicBlock,
@@ -608,7 +608,7 @@ class CodeIndexPipeline:
                     ir_text = self.ir_pass.compile_to_ir(src_path, raw_flags=flags)
                     for g in self.ir_pass.parse_ir_module(ir_text, source_file=str(src_path)):
                         ir_by_fn[g.function_name] = g
-                    with tempfile.TemporaryDirectory(dir=BUILD_TMP_ROOT) as tmp_obj_dir:
+                    with tempfile.TemporaryDirectory(dir=get_build_tmp_root()) as tmp_obj_dir:
                         obj_path = self.lifter.compile_to_object(
                             src_path,
                             out_obj_path=Path(tmp_obj_dir) / f"{src_path.stem}.o",
@@ -633,7 +633,7 @@ class CodeIndexPipeline:
                     ir_text = self.ir_pass.compile_rust_to_ir(src_path)
                     for g in self.ir_pass.parse_ir_module(ir_text, source_file=str(src_path)):
                         ir_by_fn[g.function_name] = g
-                    with tempfile.TemporaryDirectory(dir=BUILD_TMP_ROOT) as tmp_obj_dir:
+                    with tempfile.TemporaryDirectory(dir=get_build_tmp_root()) as tmp_obj_dir:
                         obj_path = self.lifter.compile_rust_to_object(
                             src_path,
                             out_obj_path=Path(tmp_obj_dir) / f"{src_path.stem}.o",

@@ -281,6 +281,7 @@ class PRReviewReport(BaseModel):
     connected_sources: list[dict[str, Any]] = Field(default_factory=list)
     permission_inventory: list[dict[str, Any]] = Field(default_factory=list)
     witness_paths: list[dict[str, Any]] = Field(default_factory=list)
+    candidate_helpers: list[dict[str, Any]] = Field(default_factory=list)
     findings: list[ReviewFinding] = Field(default_factory=list)
     indexed_file_lines: dict[str, int] = Field(default_factory=dict, exclude=True)
     indexed_symbols: set[str] = Field(default_factory=set, exclude=True)
@@ -632,6 +633,87 @@ def _first_hunk_line(ast: ASTChunkNode, hunks: list[tuple[int, int]]) -> int:
     return ast.line_start
 
 
+def _compute_function_ir_equivalence(
+    base_unit: UnifiedCodeUnit | None,
+    head_unit: UnifiedCodeUnit,
+) -> tuple[float | None, bool]:
+    """Compare lowered LLVM IR vectors, edges, and binary basic blocks for NFC equivalence."""
+    if not (
+        base_unit is not None
+        and base_unit.ir_status == IRStatus.OK
+        and head_unit.ir_status == IRStatus.OK
+        and base_unit.ir_graph is not None
+        and head_unit.ir_graph is not None
+    ):
+        return None, False
+
+    v_base = compute_wl_ir_vector(base_unit.ir_graph)
+    v_head = compute_wl_ir_vector(head_unit.ir_graph)
+    ir_sim = round(cosine_similarity(v_base, v_head), 4)
+    base_edges = sorted((e.flow_type, e.position) for e in base_unit.ir_graph.edges)
+    head_edges = sorted((e.flow_type, e.position) for e in head_unit.ir_graph.edges)
+    has_base_bin = bool(base_unit.binary_blocks)
+    has_head_bin = bool(head_unit.binary_blocks)
+    if has_base_bin != has_head_bin:
+        bin_match = False
+    elif has_base_bin and has_head_bin:
+        bin_match = [b.normalized_instructions for b in base_unit.binary_blocks] == [
+            b.normalized_instructions for b in head_unit.binary_blocks
+        ]
+    else:
+        bin_match = True
+    nfc_verified = (
+        ir_sim >= 0.99
+        and base_unit.ir_graph.canonical_tokens == head_unit.ir_graph.canonical_tokens
+        and base_edges == head_edges
+        and bin_match
+    )
+    return ir_sim, nfc_verified
+
+
+def _collect_deleted_function_blast_findings(
+    base_units: dict[tuple[str, str, str], UnifiedCodeUnit],
+    head_units: dict[tuple[str, str, str], UnifiedCodeUnit],
+    base_pipe: CodeIndexPipeline,
+    deleted_files: set[str],
+    changed_hunks: dict[str, list[tuple[int, int]]],
+) -> list[ReviewFinding]:
+    """Flag functions removed in the PR that had downstream callers in the base CPG."""
+    findings: list[ReviewFinding] = []
+    for (rel_file, scope_hdr, sym_key), base_unit in sorted(base_units.items()):
+        if (rel_file, scope_hdr, sym_key) in head_units:
+            continue
+        if rel_file not in deleted_files and rel_file not in changed_hunks:
+            continue
+        b_ast = base_unit.ast_chunk
+        if b_ast.node_kind in _CONTAINER_NODE_TYPES or base_unit.scip_symbol is None:
+            continue
+        base_slices = base_pipe.cpg.k_hop_slice(
+            base_unit.scip_symbol.symbol_uri,
+            max_hops=2,
+            edge_kinds=frozenset({CPGEdgeKind.CALLS}),
+            direction="backward",
+        )
+        base_callers = sorted({str(s["source"]) for s in base_slices})
+        if base_callers:
+            sym_name = b_ast.symbol_name or sym_key
+            findings.append(
+                ReviewFinding(
+                    severity="HIGH",
+                    category="BLAST_RADIUS",
+                    file_path=rel_file,
+                    line=b_ast.line_start,
+                    symbol_name=sym_name,
+                    message=(
+                        f"Deleted function had {len(base_callers)} downstream caller(s) "
+                        "in base CPG."
+                    ),
+                    side="LEFT",
+                )
+            )
+    return findings
+
+
 def analyze_pr_directories(
     base_dir: Path,
     head_dir: Path,
@@ -675,37 +757,7 @@ def analyze_pr_directories(
         c_before = base_unit.ast_chunk.cyclomatic_complexity if base_unit else None
         c_after = ast.cyclomatic_complexity
 
-        ir_sim: float | None = None
-        nfc_verified = False
-        if (
-            base_unit is not None
-            and base_unit.ir_status == IRStatus.OK
-            and head_unit.ir_status == IRStatus.OK
-            and base_unit.ir_graph is not None
-            and head_unit.ir_graph is not None
-        ):
-            v_base = compute_wl_ir_vector(base_unit.ir_graph)
-            v_head = compute_wl_ir_vector(head_unit.ir_graph)
-            ir_sim = round(cosine_similarity(v_base, v_head), 4)
-            base_edges = sorted((e.flow_type, e.position) for e in base_unit.ir_graph.edges)
-            head_edges = sorted((e.flow_type, e.position) for e in head_unit.ir_graph.edges)
-            has_base_bin = bool(base_unit.binary_blocks)
-            has_head_bin = bool(head_unit.binary_blocks)
-            if has_base_bin != has_head_bin:
-                bin_match = False
-            elif has_base_bin and has_head_bin:
-                bin_match = [b.normalized_instructions for b in base_unit.binary_blocks] == [
-                    b.normalized_instructions for b in head_unit.binary_blocks
-                ]
-            else:
-                bin_match = True
-            if (
-                ir_sim >= 0.99
-                and base_unit.ir_graph.canonical_tokens == head_unit.ir_graph.canonical_tokens
-                and base_edges == head_edges
-                and bin_match
-            ):
-                nfc_verified = True
+        ir_sim, nfc_verified = _compute_function_ir_equivalence(base_unit, head_unit)
 
         bb_before = len(base_unit.binary_blocks) if base_unit else None
         bb_after = len(head_unit.binary_blocks)
@@ -822,38 +874,11 @@ def analyze_pr_directories(
                     if len(pr_connected) >= 8:
                         break
 
-    # Report deleted functions that had downstream callers in base.
-    for (rel_file, scope_hdr, sym_key), base_unit in sorted(base_units.items()):
-        if (rel_file, scope_hdr, sym_key) in head_units:
-            continue
-        if rel_file not in deleted_files and rel_file not in changed_hunks:
-            continue
-        b_ast = base_unit.ast_chunk
-        if b_ast.node_kind in _CONTAINER_NODE_TYPES or base_unit.scip_symbol is None:
-            continue
-        base_slices = base_pipe.cpg.k_hop_slice(
-            base_unit.scip_symbol.symbol_uri,
-            max_hops=2,
-            edge_kinds=frozenset({CPGEdgeKind.CALLS}),
-            direction="backward",
+    findings.extend(
+        _collect_deleted_function_blast_findings(
+            base_units, head_units, base_pipe, deleted_files, changed_hunks
         )
-        base_callers = sorted({str(s["source"]) for s in base_slices})
-        if base_callers:
-            sym_name = b_ast.symbol_name or sym_key
-            findings.append(
-                ReviewFinding(
-                    severity="HIGH",
-                    category="BLAST_RADIUS",
-                    file_path=rel_file,
-                    line=b_ast.line_start,
-                    symbol_name=sym_name,
-                    message=(
-                        f"Deleted function had {len(base_callers)} downstream caller(s) "
-                        "in base CPG."
-                    ),
-                    side="LEFT",
-                )
-            )
+    )
 
     # Audit base vs head permissions & security risks so PR catches new Guest/bypass issues.
     base_perm_res = audit_repository_permissions_and_security(
@@ -909,6 +934,7 @@ def analyze_pr_directories(
         connected_sources=pr_connected[:8],
         permission_inventory=pr_perm_inv,
         witness_paths=pr_witness_paths,
+        candidate_helpers=head_perm_res.candidate_helpers,
         findings=findings,
         indexed_file_lines=indexed_file_lines,
         indexed_symbols=indexed_symbols,
@@ -1049,11 +1075,13 @@ def _cluster_clones(clone_pairs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     visited.add(nxt)
                     queue.append(nxt)
         if len(comp) >= 2:
+            avg_sim = round(sum(sims) / len(sims), 4) if sims else 1.0
             clusters.append(
                 {
                     "members": sorted(comp),
                     "min_similarity": min(sims) if sims else 1.0,
                     "max_similarity": max(sims) if sims else 1.0,
+                    "avg_similarity": avg_sim,
                 }
             )
     clusters.sort(key=lambda c: len(c["members"]), reverse=True)

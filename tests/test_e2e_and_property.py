@@ -12,7 +12,7 @@ from hypothesis import strategies as st
 import mcp_server.code_index_server as code_index_server
 from indexer.ast_chunker import ASTChunker
 from indexer.binary_lifter import BinaryLifter
-from indexer.llvm_ir_pass import BUILD_TMP_ROOT
+from indexer.llvm_ir_pass import get_build_tmp_root
 from indexer.models import IRStatus
 from indexer.semantic_cpg import SemanticCPGBuilder
 from mcp_server.code_index_server import (
@@ -84,10 +84,11 @@ def test_workspace_skips_ignored_dirs_and_cleans_tmp(tmp_path: Path) -> None:
     )
     (tmp_path / "app.py").write_text("def main_fn():\n    return 42\n", encoding="utf-8")
 
-    before_dirs = set(BUILD_TMP_ROOT.iterdir()) if BUILD_TMP_ROOT.exists() else set()
+    tmp_root = get_build_tmp_root()
+    before_dirs = set(tmp_root.iterdir()) if tmp_root.exists() else set()
     pipeline = CodeIndexPipeline()
     summary = pipeline.index_workspace(tmp_path)
-    after_dirs = set(BUILD_TMP_ROOT.iterdir()) if BUILD_TMP_ROOT.exists() else set()
+    after_dirs = set(tmp_root.iterdir()) if tmp_root.exists() else set()
 
     assert summary["indexed_units"] == 1
     assert after_dirs == before_dirs

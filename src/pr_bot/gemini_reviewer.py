@@ -561,6 +561,38 @@ def generate_vertex_gemini_review(
 
     client = _create_genai_client(project=project, location=location, api_key=api_key)
 
+    candidate_helpers = getattr(report, "candidate_helpers", None) or []
+    if candidate_helpers:
+        verdicts = classify_custom_guard_helpers(
+            candidate_helpers,
+            project=project,
+            location=location,
+            model=model,
+            api_key=api_key,
+        )
+        guarded_syms = {
+            str(h.get("symbol_name", ""))
+            for h in candidate_helpers
+            if verdicts.get(str(h.get("content_hash", "")), ("NEUTRAL", ""))[0]
+            in ("AUTH_GUARD", "SANITIZER")
+        }
+        if guarded_syms and getattr(report, "witness_paths", None):
+            report.witness_paths = [
+                wp
+                for wp in report.witness_paths
+                if not any(
+                    s.get("symbol_name") in guarded_syms
+                    for s in (wp.get("steps") or [])[1:-1]
+                )
+            ]
+            active_src_syms = {wp.get("source_symbol") for wp in report.witness_paths}
+            report.findings = [
+                f
+                for f in report.findings
+                if f.category != "GUEST_PRIVILEGE_ESCALATION"
+                or f.symbol_name in active_src_syms
+            ]
+
     prompt = build_review_prompt(report, diff_text, max_prompt_tokens=max_prompt_tokens)
     sys_inst = (
         _PR_SYSTEM_INSTRUCTION

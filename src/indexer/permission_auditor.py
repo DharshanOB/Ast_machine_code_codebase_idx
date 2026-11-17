@@ -108,8 +108,10 @@ def _is_test_path(rel_file: str) -> bool:
     )
 
 
-def _is_ignored_dir(name: str) -> bool:
-    return name in _AUDITOR_IGNORED_DIRS or name.startswith(".")
+def _is_ignored_dir(name: str, *, include_dot_github: bool = False) -> bool:
+    return name in _AUDITOR_IGNORED_DIRS or (
+        name.startswith(".") and not (include_dot_github and name == ".github")
+    )
 
 
 def _rel_path(path_str: str | Path, root: Path) -> str:
@@ -125,12 +127,7 @@ def _iter_repo_files(root: Path, *, include_dot_github: bool = False) -> Iterabl
         return
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
-            d
-            for d in dirnames
-            if not (
-                d in _AUDITOR_IGNORED_DIRS
-                or (d.startswith(".") and not (include_dot_github and d == ".github"))
-            )
+            d for d in dirnames if not _is_ignored_dir(d, include_dot_github=include_dot_github)
         )
         base = Path(dirpath)
         for fname in sorted(filenames):
@@ -517,43 +514,77 @@ def _strip_docstring(stmts: list[ast.stmt]) -> list[ast.stmt]:
     return stmts
 
 
+def _is_noop_stmt(stmt: ast.stmt) -> bool:
+    """Return True if stmt is `pass` or an ellipsis expression `...`."""
+    if isinstance(stmt, ast.Pass):
+        return True
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and stmt.value.value is Ellipsis
+    )
+
+
+def _walk_fn_body_shallow(stmts: list[ast.stmt]) -> list[ast.AST]:
+    """Walk statements inside a function body without descending into nested functions/classes."""
+    nodes: list[ast.AST] = []
+    stack: list[ast.AST] = list(reversed(stmts))
+    while stack:
+        curr = stack.pop()
+        nodes.append(curr)
+        for child in reversed(list(ast.iter_child_nodes(curr))):
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                stack.append(child)
+    return nodes
+
+
 def _extract_fn_security_signals(
     fn_node: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> dict[str, bool]:
     """Summarize AST enforcement, branching, and return behavior for a Python function."""
     effective = _strip_docstring(list(fn_node.body))
-    returns = [n for n in ast.walk(fn_node) if isinstance(n, ast.Return)]
-    calls = [_call_dotted_name(n.func) for n in ast.walk(fn_node) if isinstance(n, ast.Call)]
-    has_if = any(isinstance(n, (ast.If, ast.IfExp)) for n in ast.walk(fn_node))
-    has_raise = any(isinstance(n, ast.Raise) for n in ast.walk(fn_node))
+    body_nodes = _walk_fn_body_shallow(effective)
+    returns = [n for n in body_nodes if isinstance(n, ast.Return)]
+    calls = [_call_dotted_name(n.func).lower() for n in body_nodes if isinstance(n, ast.Call)]
+    has_if = any(isinstance(n, (ast.If, ast.IfExp)) for n in body_nodes)
+    has_raise = any(isinstance(n, (ast.Raise, ast.Assert)) for n in body_nodes)
     has_throw = any(
         c.endswith((".throw", "abort", "sys.exit")) or c == "throw" for c in calls
     )
     only_true_return = bool(returns) and all(
-        isinstance(r.value, ast.Constant) and r.value.value is True for r in returns
+        isinstance(r.value, ast.Constant)
+        and isinstance(r.value.value, (bool, int))
+        and bool(r.value.value) is True
+        for r in returns
     )
     top_level_true = any(
-        isinstance(s, ast.Return) and isinstance(s.value, ast.Constant) and s.value.value is True
+        isinstance(s, ast.Return)
+        and isinstance(s.value, ast.Constant)
+        and isinstance(s.value.value, (bool, int))
+        and bool(s.value.value) is True
         for s in effective
     )
-    top_level_noop = not effective or all(isinstance(s, ast.Pass) for s in effective)
-    src_dump = ast.dump(fn_node).lower()
-    has_auth_sig = any(tok in src_dump for tok in _AUTH_SIGNAL_TOKENS)
+    top_level_noop = not effective or all(_is_noop_stmt(s) for s in effective)
+    has_auth_call = any(
+        any(tok in c for tok in _AUTH_SIGNAL_TOKENS)
+        for c in calls
+    )
     has_in_check = any(
         isinstance(n, ast.Assert)
         or (isinstance(n, ast.Compare) and any(isinstance(op, (ast.In, ast.NotIn)) for op in n.ops))
-        for n in ast.walk(fn_node)
+        for n in body_nodes
     )
+    has_compare_predicate = any(isinstance(r.value, ast.Compare) for r in returns)
     has_sanitizer_sig = has_in_check or any(
         c.rsplit(".", 1)[-1] in _SANITIZER_SIGNAL_TOKENS for c in calls
     )
     return {
         "is_noop": top_level_noop,
-        "only_true_return": only_true_return,
+        "only_true_return": only_true_return and not has_if,
         "unconditional_true": top_level_true,
-        "has_if": has_if,
+        "has_if": has_if or has_compare_predicate,
         "has_rejection": has_raise or has_throw,
-        "has_auth_signal": has_auth_sig,
+        "has_auth_signal": has_auth_call and (has_if or has_raise or has_throw or bool(returns)),
         "has_sanitizer_signal": has_sanitizer_sig,
     }
 
@@ -683,9 +714,298 @@ def _detect_false_security_claims(
     return findings, inventory, is_fake_guard
 
 
+@dataclass
+class _PythonChunkAuditState:
+    rel_file: str
+    sym: str
+    base_offset: int
+    allow_guest: bool
+    is_whitelisted: bool
+    has_auth_guard: bool
+    has_type_check: bool
+    param_names: set[str]
+    top_fn: ast.FunctionDef | ast.AsyncFunctionDef | None
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    inventory: list[dict[str, Any]] = field(default_factory=list)
+    privileged_sinks: list[str] = field(default_factory=list)
+    saw_guest_mutation_finding: bool = False
+    saw_untyped_orm_filter: bool = False
+
+
+def _record_bypass_finding(
+    state: _PythonChunkAuditState,
+    sink_label: str,
+    line_no: int,
+) -> None:
+    state.privileged_sinks.append(sink_label)
+    sev = "HIGH" if state.allow_guest else "MEDIUM"
+    msg = (
+        f"`{sink_label}` bypasses Frappe permission checks"
+        + (" inside an `allow_guest=True` endpoint." if state.allow_guest else ".")
+    )
+    state.inventory.append(
+        {
+            "file_path": state.rel_file,
+            "line": line_no,
+            "symbol_name": state.sym,
+            "role_or_scope": "Permission Bypass",
+            "permission": sink_label,
+            "severity": sev,
+            "reason": msg,
+        }
+    )
+    state.findings.append(
+        {
+            "severity": sev,
+            "category": "GUEST_PERMISSION" if state.allow_guest else "PERMISSION_BYPASS",
+            "file_path": state.rel_file,
+            "line": line_no,
+            "symbol_name": state.sym,
+            "message": msg,
+        }
+    )
+    if state.allow_guest:
+        state.saw_guest_mutation_finding = True
+
+
+def _check_python_assign_bypasses(tree: ast.AST, state: _PythonChunkAuditState) -> None:
+    """Detect attribute assignments such as `doc.flags.ignore_permissions = True`."""
+    for assign in (n for n in ast.walk(tree) if isinstance(n, ast.Assign)):
+        val_is_truthy = isinstance(assign.value, ast.Constant) and bool(assign.value.value)
+        if not val_is_truthy:
+            continue
+        for tgt in assign.targets:
+            tname = _call_dotted_name(tgt)
+            if tname.endswith(".ignore_permissions") or tname.endswith(
+                ".ignore_user_permissions"
+            ):
+                line_no = state.base_offset + getattr(assign, "lineno", 1)
+                _record_bypass_finding(state, f"{tname}=True", line_no)
+
+
+def _check_frappe_call_sink(
+    sub: ast.Call,
+    cname: str,
+    line_no: int,
+    state: _PythonChunkAuditState,
+) -> None:
+    """Inspect Frappe permission bypass, privilege escalation, ORM, SQL, and commit sinks."""
+    for bypass_kw in ("ignore_permissions", "ignore_user_permissions"):
+        if _kwarg_truthy(sub, bypass_kw):
+            _record_bypass_finding(state, f"{cname}({bypass_kw}=True)", line_no)
+
+    if cname.endswith("set_user") and sub.args:
+        arg0 = sub.args[0]
+        if isinstance(arg0, ast.Constant) and str(arg0.value) == "Administrator":
+            state.privileged_sinks.append('set_user("Administrator")')
+            restores = state.top_fn is not None and _has_try_finally_restore(state.top_fn)
+            sev = "HIGH" if (state.allow_guest or not restores) else "MEDIUM"
+            msg = (
+                '`frappe.set_user("Administrator")` escalates session to System Admin'
+                + ("" if restores else " without a `try/finally` user restore.")
+            )
+            state.inventory.append(
+                {
+                    "file_path": state.rel_file,
+                    "line": line_no,
+                    "symbol_name": state.sym,
+                    "role_or_scope": "Privilege Escalation",
+                    "permission": 'set_user("Administrator")',
+                    "severity": sev,
+                    "reason": msg,
+                }
+            )
+            state.findings.append(
+                {
+                    "severity": sev,
+                    "category": "PRIVILEGE_ESCALATION",
+                    "file_path": state.rel_file,
+                    "line": line_no,
+                    "symbol_name": state.sym,
+                    "message": msg,
+                }
+            )
+
+    if cname in ("frappe.get_all", "frappe.db.get_all"):
+        state.privileged_sinks.append(cname)
+        if state.is_whitelisted:
+            sev = "HIGH" if state.allow_guest else "MEDIUM"
+            msg = (
+                f"`{cname}` bypasses user/document permissions inside "
+                + (
+                    "an `allow_guest=True` endpoint"
+                    if state.allow_guest
+                    else "a whitelisted method"
+                )
+                + "; prefer `frappe.get_list`."
+            )
+            state.findings.append(
+                {
+                    "severity": sev,
+                    "category": (
+                        "GUEST_PERMISSION" if state.allow_guest else "PERMISSION_BYPASS"
+                    ),
+                    "file_path": state.rel_file,
+                    "line": line_no,
+                    "symbol_name": state.sym,
+                    "message": msg,
+                }
+            )
+            state.saw_guest_mutation_finding = (
+                state.saw_guest_mutation_finding or state.allow_guest
+            )
+
+    if cname in (
+        "frappe.db.set_value",
+        "frappe.db.delete",
+        "frappe.get_doc",
+        "frappe.new_doc",
+        "frappe.delete_doc",
+    ):
+        state.privileged_sinks.append(cname)
+        if (
+            state.allow_guest
+            and not state.has_auth_guard
+            and not state.saw_guest_mutation_finding
+        ):
+            state.saw_guest_mutation_finding = True
+            state.findings.append(
+                {
+                    "severity": "HIGH",
+                    "category": "GUEST_PERMISSION",
+                    "file_path": state.rel_file,
+                    "line": line_no,
+                    "symbol_name": state.sym,
+                    "message": (
+                        f"`allow_guest=True` endpoint invokes `{cname}` without an explicit "
+                        "permission or signature check."
+                    ),
+                }
+            )
+
+    if (
+        state.is_whitelisted
+        and not state.has_type_check
+        and not state.saw_untyped_orm_filter
+        and cname
+        in ("frappe.db.get_value", "frappe.db.get_list", "frappe.get_list", "frappe.db.exists")
+    ):
+        used_param = any(
+            isinstance(n, ast.Name) and n.id in state.param_names
+            for arg in [*sub.args, *(k.value for k in sub.keywords)]
+            for n in ast.walk(arg)
+        )
+        if used_param:
+            state.saw_untyped_orm_filter = True
+            state.findings.append(
+                {
+                    "severity": "MEDIUM",
+                    "category": "SECURITY_RISK",
+                    "file_path": state.rel_file,
+                    "line": line_no,
+                    "symbol_name": state.sym,
+                    "message": (
+                        f"Whitelisted `{cname}` uses parameter(s) without an "
+                        "`isinstance(..., str)` type check (risk of ORM list-filter bypass)."
+                    ),
+                }
+            )
+
+    if cname == "frappe.db.sql" and sub.args and _is_dynamic_sql_arg(sub.args[0]):
+        state.privileged_sinks.append("frappe.db.sql(dynamic)")
+        state.findings.append(
+            {
+                "severity": "HIGH",
+                "category": "SQL_INJECTION",
+                "file_path": state.rel_file,
+                "line": line_no,
+                "symbol_name": state.sym,
+                "message": (
+                    "Dynamic SQL interpolation in `frappe.db.sql`; use parameterized `%s` "
+                    "placeholders or `frappe.qb`."
+                ),
+            }
+        )
+
+    if cname in ("frappe.db.commit", "frappe.db.rollback"):
+        state.findings.append(
+            {
+                "severity": "MEDIUM",
+                "category": "ATOMICITY_RISK",
+                "file_path": state.rel_file,
+                "line": line_no,
+                "symbol_name": state.sym,
+                "message": (
+                    f"Explicit `{cname}()` mid-request breaks transaction atomicity and "
+                    "can persist partial state."
+                ),
+            }
+        )
+
+
+def _check_general_python_call_sink(
+    sub: ast.Call,
+    cname: str,
+    line_no: int,
+    state: _PythonChunkAuditState,
+) -> None:
+    """Inspect dangerous Python sinks (`eval`/`exec`, `shell=True`, world-writable chmod)."""
+    if cname in ("eval", "exec"):
+        state.privileged_sinks.append(cname)
+        state.findings.append(
+            {
+                "severity": "HIGH",
+                "category": "SECURITY_RISK",
+                "file_path": state.rel_file,
+                "line": line_no,
+                "symbol_name": state.sym,
+                "message": f"Dangerous dynamic code execution `{cname}()`.",
+            }
+        )
+    elif cname.startswith("subprocess.") and _kwarg_truthy(sub, "shell"):
+        state.privileged_sinks.append(f"{cname}(shell=True)")
+        state.findings.append(
+            {
+                "severity": "HIGH",
+                "category": "SECURITY_RISK",
+                "file_path": state.rel_file,
+                "line": line_no,
+                "symbol_name": state.sym,
+                "message": f"`{cname}(..., shell=True)` permits shell injection.",
+            }
+        )
+    elif cname in ("os.chmod", "chmod") and len(sub.args) >= 2:
+        mode_arg = sub.args[1]
+        if isinstance(mode_arg, ast.Constant) and isinstance(mode_arg.value, int):
+            if (mode_arg.value & 0o002) != 0:
+                perm_oct = oct(mode_arg.value)
+                state.inventory.append(
+                    {
+                        "file_path": state.rel_file,
+                        "line": line_no,
+                        "symbol_name": state.sym,
+                        "role_or_scope": "Filesystem Mode",
+                        "permission": perm_oct,
+                        "severity": "HIGH",
+                        "reason": f"World-writable file mode `{perm_oct}` passed to `{cname}`.",
+                    }
+                )
+                state.findings.append(
+                    {
+                        "severity": "HIGH",
+                        "category": "UNWANTED_PERMISSION",
+                        "file_path": state.rel_file,
+                        "line": line_no,
+                        "symbol_name": state.sym,
+                        "message": f"World-writable file permission `{perm_oct}` in `{cname}`.",
+                    }
+                )
+
+
 def _inspect_python_chunk(
     chunk: ASTChunkNode,
     rel_file: str,
+    fake_guard_names: set[str] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -695,16 +1015,10 @@ def _inspect_python_chunk(
     list[str],
 ]:
     """Inspect a Python AST chunk for permissions, bypasses, guards, and security risks."""
-    findings: list[dict[str, Any]] = []
-    inventory: list[dict[str, Any]] = []
-    is_guest_entry = False
-    has_auth_guard = False
-    privileged_sinks: list[str] = []
-
     try:
         tree = ast.parse(textwrap.dedent(chunk.source_text))
     except SyntaxError:
-        return findings, inventory, False, False, False, []
+        return [], [], False, False, False, []
 
     base_offset = max(0, chunk.line_start - 1)
     fn_nodes = [
@@ -716,11 +1030,13 @@ def _inspect_python_chunk(
     param_names = _extract_param_names(top_fn) if top_fn else set()
     has_type_check = _has_type_guard(top_fn, param_names) if top_fn else True
 
+    ignored_guards = fake_guard_names or set()
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
-    for sub in calls:
-        cname = _call_dotted_name(sub.func)
-        if any(
-            g in cname
+    has_auth_guard = any(
+        _call_dotted_name(sub.func) not in ignored_guards
+        and _call_dotted_name(sub.func).rsplit(".", 1)[-1] not in ignored_guards
+        and any(
+            g in _call_dotted_name(sub.func)
             for g in (
                 "has_permission",
                 "only_for",
@@ -729,12 +1045,26 @@ def _inspect_python_chunk(
                 "hmac.compare_digest",
                 "validate_webhook",
             )
-        ):
-            has_auth_guard = True
+        )
+        for sub in calls
+    )
 
+    state = _PythonChunkAuditState(
+        rel_file=rel_file,
+        sym=sym,
+        base_offset=base_offset,
+        allow_guest=allow_guest,
+        is_whitelisted=is_whitelisted,
+        has_auth_guard=has_auth_guard,
+        has_type_check=has_type_check,
+        param_names=param_names,
+        top_fn=top_fn,
+    )
+
+    is_guest_entry = False
     if allow_guest:
         is_guest_entry = True
-        inventory.append(
+        state.inventory.append(
             {
                 "file_path": rel_file,
                 "line": chunk.line_start,
@@ -748,285 +1078,15 @@ def _inspect_python_chunk(
     elif sym == "get_context" and "frappe" in chunk.source_text:
         is_guest_entry = True
 
-    saw_untyped_orm_filter = False
-    saw_guest_mutation_finding = False
-
-    # Detect attribute assignments such as `doc.flags.ignore_permissions = True`
-    for assign in (n for n in ast.walk(tree) if isinstance(n, ast.Assign)):
-        val_is_truthy = isinstance(assign.value, ast.Constant) and bool(assign.value.value)
-        if not val_is_truthy:
-            continue
-        for tgt in assign.targets:
-            tname = _call_dotted_name(tgt)
-            if tname.endswith(".ignore_permissions") or tname.endswith(
-                ".ignore_user_permissions"
-            ):
-                line_no = base_offset + getattr(assign, "lineno", 1)
-                sink_label = f"{tname}=True"
-                privileged_sinks.append(sink_label)
-                sev = "HIGH" if allow_guest else "MEDIUM"
-                msg = (
-                    f"`{sink_label}` bypasses Frappe permission checks"
-                    + (" inside an `allow_guest=True` endpoint." if allow_guest else ".")
-                )
-                inventory.append(
-                    {
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "role_or_scope": "Permission Bypass",
-                        "permission": sink_label,
-                        "severity": sev,
-                        "reason": msg,
-                    }
-                )
-                findings.append(
-                    {
-                        "severity": sev,
-                        "category": "GUEST_PERMISSION" if allow_guest else "PERMISSION_BYPASS",
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "message": msg,
-                    }
-                )
-                if allow_guest:
-                    saw_guest_mutation_finding = True
-
+    _check_python_assign_bypasses(tree, state)
     for sub in calls:
         cname = _call_dotted_name(sub.func)
         line_no = base_offset + getattr(sub, "lineno", 1)
+        _check_frappe_call_sink(sub, cname, line_no, state)
+        _check_general_python_call_sink(sub, cname, line_no, state)
 
-        # Permission bypass keyword flags
-        for bypass_kw in ("ignore_permissions", "ignore_user_permissions"):
-            if _kwarg_truthy(sub, bypass_kw):
-                sink_label = f"{cname}({bypass_kw}=True)"
-                privileged_sinks.append(sink_label)
-                sev = "HIGH" if allow_guest else "MEDIUM"
-                msg = (
-                    f"`{sink_label}` bypasses Frappe permission checks"
-                    + (" inside an `allow_guest=True` endpoint." if allow_guest else ".")
-                )
-                inventory.append(
-                    {
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "role_or_scope": "Permission Bypass",
-                        "permission": sink_label,
-                        "severity": sev,
-                        "reason": msg,
-                    }
-                )
-                findings.append(
-                    {
-                        "severity": sev,
-                        "category": "GUEST_PERMISSION" if allow_guest else "PERMISSION_BYPASS",
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "message": msg,
-                    }
-                )
-                if allow_guest:
-                    saw_guest_mutation_finding = True
-
-        # Privilege escalation via frappe.set_user("Administrator")
-        if cname.endswith("set_user") and sub.args:
-            arg0 = sub.args[0]
-            if isinstance(arg0, ast.Constant) and str(arg0.value) == "Administrator":
-                privileged_sinks.append('set_user("Administrator")')
-                restores = top_fn is not None and _has_try_finally_restore(top_fn)
-                sev = "HIGH" if (allow_guest or not restores) else "MEDIUM"
-                msg = (
-                    '`frappe.set_user("Administrator")` escalates session to System Admin'
-                    + ("" if restores else " without a `try/finally` user restore.")
-                )
-                inventory.append(
-                    {
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "role_or_scope": "Privilege Escalation",
-                        "permission": 'set_user("Administrator")',
-                        "severity": sev,
-                        "reason": msg,
-                    }
-                )
-                findings.append(
-                    {
-                        "severity": sev,
-                        "category": "PRIVILEGE_ESCALATION",
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "message": msg,
-                    }
-                )
-
-        # frappe.get_all vs get_list in whitelisted endpoints
-        if cname in ("frappe.get_all", "frappe.db.get_all"):
-            privileged_sinks.append(cname)
-            if is_whitelisted:
-                sev = "HIGH" if allow_guest else "MEDIUM"
-                msg = (
-                    f"`{cname}` bypasses user/document permissions inside "
-                    + ("an `allow_guest=True` endpoint" if allow_guest else "a whitelisted method")
-                    + "; prefer `frappe.get_list`."
-                )
-                findings.append(
-                    {
-                        "severity": sev,
-                        "category": "GUEST_PERMISSION" if allow_guest else "PERMISSION_BYPASS",
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "message": msg,
-                    }
-                )
-                saw_guest_mutation_finding = saw_guest_mutation_finding or allow_guest
-
-        # Direct DB mutations inside allow_guest=True
-        if cname in (
-            "frappe.db.set_value",
-            "frappe.db.delete",
-            "frappe.get_doc",
-            "frappe.new_doc",
-            "frappe.delete_doc",
-        ):
-            privileged_sinks.append(cname)
-            if allow_guest and not has_auth_guard and not saw_guest_mutation_finding:
-                saw_guest_mutation_finding = True
-                findings.append(
-                    {
-                        "severity": "HIGH",
-                        "category": "GUEST_PERMISSION",
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "message": (
-                            f"`allow_guest=True` endpoint invokes `{cname}` without an explicit "
-                            "permission or signature check."
-                        ),
-                    }
-                )
-
-        # Type-confusion check on whitelisted ORM queries
-        if (
-            is_whitelisted
-            and not has_type_check
-            and not saw_untyped_orm_filter
-            and cname
-            in ("frappe.db.get_value", "frappe.db.get_list", "frappe.get_list", "frappe.db.exists")
-        ):
-            used_param = any(
-                isinstance(n, ast.Name) and n.id in param_names
-                for arg in [*sub.args, *(k.value for k in sub.keywords)]
-                for n in ast.walk(arg)
-            )
-            if used_param:
-                saw_untyped_orm_filter = True
-                findings.append(
-                    {
-                        "severity": "MEDIUM",
-                        "category": "SECURITY_RISK",
-                        "file_path": rel_file,
-                        "line": line_no,
-                        "symbol_name": sym,
-                        "message": (
-                            f"Whitelisted `{cname}` uses parameter(s) without an "
-                            "`isinstance(..., str)` type check (risk of ORM list-filter bypass)."
-                        ),
-                    }
-                )
-
-        # Raw SQL string interpolation
-        if cname == "frappe.db.sql" and sub.args and _is_dynamic_sql_arg(sub.args[0]):
-            privileged_sinks.append("frappe.db.sql(dynamic)")
-            findings.append(
-                {
-                    "severity": "HIGH",
-                    "category": "SQL_INJECTION",
-                    "file_path": rel_file,
-                    "line": line_no,
-                    "symbol_name": sym,
-                    "message": (
-                        "Dynamic SQL interpolation in `frappe.db.sql`; use parameterized `%s` "
-                        "placeholders or `frappe.qb`."
-                    ),
-                }
-            )
-
-        # Mid-transaction commit/rollback
-        if cname in ("frappe.db.commit", "frappe.db.rollback"):
-            findings.append(
-                {
-                    "severity": "MEDIUM",
-                    "category": "ATOMICITY_RISK",
-                    "file_path": rel_file,
-                    "line": line_no,
-                    "symbol_name": sym,
-                    "message": (
-                        f"Explicit `{cname}()` mid-request breaks transaction atomicity and "
-                        "can persist partial state."
-                    ),
-                }
-            )
-
-        # General Python security sinks
-        if cname in ("eval", "exec"):
-            privileged_sinks.append(cname)
-            findings.append(
-                {
-                    "severity": "HIGH",
-                    "category": "SECURITY_RISK",
-                    "file_path": rel_file,
-                    "line": line_no,
-                    "symbol_name": sym,
-                    "message": f"Dangerous dynamic code execution `{cname}()`.",
-                }
-            )
-        elif cname.startswith("subprocess.") and _kwarg_truthy(sub, "shell"):
-            privileged_sinks.append(f"{cname}(shell=True)")
-            findings.append(
-                {
-                    "severity": "HIGH",
-                    "category": "SECURITY_RISK",
-                    "file_path": rel_file,
-                    "line": line_no,
-                    "symbol_name": sym,
-                    "message": f"`{cname}(..., shell=True)` permits shell injection.",
-                }
-            )
-        elif cname in ("os.chmod", "chmod") and len(sub.args) >= 2:
-            mode_arg = sub.args[1]
-            if isinstance(mode_arg, ast.Constant) and isinstance(mode_arg.value, int):
-                if (mode_arg.value & 0o002) != 0:
-                    perm_oct = oct(mode_arg.value)
-                    inventory.append(
-                        {
-                            "file_path": rel_file,
-                            "line": line_no,
-                            "symbol_name": sym,
-                            "role_or_scope": "Filesystem Mode",
-                            "permission": perm_oct,
-                            "severity": "HIGH",
-                            "reason": f"World-writable file mode `{perm_oct}` passed to `{cname}`.",
-                        }
-                    )
-                    findings.append(
-                        {
-                            "severity": "HIGH",
-                            "category": "UNWANTED_PERMISSION",
-                            "file_path": rel_file,
-                            "line": line_no,
-                            "symbol_name": sym,
-                            "message": f"World-writable file permission `{perm_oct}` in `{cname}`.",
-                        }
-                    )
-
-    if allow_guest and not saw_guest_mutation_finding and not has_auth_guard:
-        findings.append(
+    if allow_guest and not state.saw_guest_mutation_finding and not has_auth_guard:
+        state.findings.append(
             {
                 "severity": "MEDIUM",
                 "category": "GUEST_PERMISSION",
@@ -1040,7 +1100,14 @@ def _inspect_python_chunk(
             }
         )
 
-    return findings, inventory, is_guest_entry, has_auth_guard, is_whitelisted, privileged_sinks
+    return (
+        state.findings,
+        state.inventory,
+        is_guest_entry,
+        has_auth_guard,
+        is_whitelisted,
+        state.privileged_sinks,
+    )
 
 
 def _scan_workflow_and_container_permissions(
@@ -1609,6 +1676,24 @@ def audit_repository_permissions_and_security(
     fake_guard_names: set[str] = set()
     whitelisted_uids: set[str] = set()
 
+    # Pass 1: Pre-collect fake/no-op guard names and URIs across Python units
+    for unit in unit_list:
+        ast_chunk = unit.ast_chunk
+        if ast_chunk.node_kind in _CONTAINER_AST_KINDS or ast_chunk.language != Language.PYTHON:
+            continue
+        rel_file = _rel_path(ast_chunk.file_path, root)
+        if _is_test_path(rel_file):
+            continue
+        _, _, is_fake_guard = _detect_false_security_claims(
+            ast_chunk, rel_file, hooks_spec, has_auth_guard=False
+        )
+        if is_fake_guard:
+            if ast_chunk.symbol_name:
+                fake_guard_names.add(ast_chunk.symbol_name)
+            if unit.scip_symbol is not None:
+                fake_guard_uris.add(unit.scip_symbol.symbol_uri)
+
+    # Pass 2: Full inspection honoring fake_guard_names
     for unit in unit_list:
         ast_chunk = unit.ast_chunk
         if ast_chunk.node_kind in _CONTAINER_AST_KINDS:
@@ -1618,7 +1703,7 @@ def audit_repository_permissions_and_security(
             continue
         if ast_chunk.language == Language.PYTHON:
             u_findings, u_inv, is_guest, has_guard, is_wl, sinks = _inspect_python_chunk(
-                ast_chunk, rel_file
+                ast_chunk, rel_file, fake_guard_names=fake_guard_names
             )
             fc_findings, fc_inv, is_fake_guard = _detect_false_security_claims(
                 ast_chunk, rel_file, hooks_spec, has_guard
@@ -1627,12 +1712,7 @@ def audit_repository_permissions_and_security(
             findings.extend(fc_findings)
             inventory.extend(u_inv)
             inventory.extend(fc_inv)
-            if is_fake_guard:
-                if ast_chunk.symbol_name:
-                    fake_guard_names.add(ast_chunk.symbol_name)
-                if unit.scip_symbol is not None:
-                    fake_guard_uris.add(unit.scip_symbol.symbol_uri)
-            elif has_guard and unit.scip_symbol is not None:
+            if not is_fake_guard and has_guard and unit.scip_symbol is not None:
                 guard_uris.add(unit.scip_symbol.symbol_uri)
             if is_wl:
                 whitelisted_uids.add(unit.unit_id)

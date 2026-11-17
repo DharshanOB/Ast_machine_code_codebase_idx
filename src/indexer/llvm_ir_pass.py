@@ -20,8 +20,14 @@ ALLOWED_CLANG_PREFIXES: tuple[str, ...] = ("-I", "-isystem", "-D", "-U", "-std="
 MAX_GRAPH_NODES: int = 10_000
 MAX_COMPILER_TIMEOUT_S: float = 15.0
 MAX_COMPILER_MEMORY_BYTES: int = 2 * 1024 * 1024 * 1024  # 2 GB
-BUILD_TMP_ROOT = Path(tempfile.mkdtemp(prefix="astraea-build-"))
-atexit.register(shutil.rmtree, BUILD_TMP_ROOT, True)
+
+
+@functools.lru_cache(maxsize=1)
+def get_build_tmp_root() -> Path:
+    """Lazily create and register cleanup for the compiler temporary directory root."""
+    root = Path(tempfile.mkdtemp(prefix="astraea-build-"))
+    atexit.register(shutil.rmtree, root, True)
+    return root
 
 _SSA_REG_RE = re.compile(r"%([A-Za-z0-9_.$-]+)")
 _DBG_REF_RE = re.compile(r"!dbg\s+!(\d+)")
@@ -96,26 +102,30 @@ def extract_leaf_symbol_name(raw_name: str) -> str:
     return clean
 
 
+_FORBIDDEN_FLAG_SUBSTRINGS: tuple[str, ...] = ("@", "-fplugin", "-xclang", "-mllvm", "-specs=")
+
+
+def _has_forbidden_flag_token(token: str) -> bool:
+    low = token.lower()
+    return any(bad in low for bad in _FORBIDDEN_FLAG_SUBSTRINGS)
+
+
 def sanitize_compile_flags(raw_flags: list[str]) -> list[str]:
-    """Allowlist-filter compiler flags to prevent SEC-01 flag/plugin injection."""
+    """Allowlist-filter compiler flags to prevent SEC-01 flag/plugin/response-file injection."""
     safe_flags: list[str] = []
     skip_next = False
     for i, flag in enumerate(raw_flags):
         if skip_next:
             skip_next = False
             continue
-        if flag.startswith("@"):
+        if _has_forbidden_flag_token(flag):
             continue
         if flag in ("-I", "-isystem", "-D", "-U", "-target") and i + 1 < len(raw_flags):
             arg = raw_flags[i + 1]
-            if (
-                not arg.startswith("@")
-                and "-fplugin" not in arg
-                and not (flag == "-target" and arg.startswith("-"))
-            ):
+            if not arg.startswith("-") and not _has_forbidden_flag_token(arg):
                 safe_flags.extend([flag, arg])
             skip_next = True
-        elif flag.startswith(ALLOWED_CLANG_PREFIXES) and "-fplugin" not in flag:
+        elif flag.startswith(ALLOWED_CLANG_PREFIXES):
             safe_flags.append(flag)
     return safe_flags
 
@@ -166,7 +176,7 @@ class LLVMIRPass:
     def __init__(self, clang_bin: str = "clang-18") -> None:
         self.clang_bin = resolve_clang_binary(clang_bin)
         self.rustc_bin = shutil.which("rustc")
-        BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        get_build_tmp_root().mkdir(parents=True, exist_ok=True)
 
     def compile_to_ir(
         self,
@@ -181,7 +191,7 @@ class LLVMIRPass:
 
         src = Path(source_path)
         safe_flags = sanitize_compile_flags(raw_flags or [])
-        with tempfile.TemporaryDirectory(dir=BUILD_TMP_ROOT) as tmp_dir:
+        with tempfile.TemporaryDirectory(dir=get_build_tmp_root()) as tmp_dir:
             out_ll = Path(tmp_dir) / f"{src.stem}.ll"
             cmd: list[str] = [
                 self.clang_bin,
@@ -204,7 +214,7 @@ class LLVMIRPass:
         if self.rustc_bin is None:
             raise RuntimeError("No rustc compiler binary found on PATH")
         src = Path(source_path)
-        with tempfile.TemporaryDirectory(dir=BUILD_TMP_ROOT) as tmp_dir:
+        with tempfile.TemporaryDirectory(dir=get_build_tmp_root()) as tmp_dir:
             out_ll = Path(tmp_dir) / f"{src.stem}.ll"
             cmd = [
                 self.rustc_bin,

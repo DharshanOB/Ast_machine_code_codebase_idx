@@ -497,3 +497,126 @@ def test_100k_token_budget_packs_more_than_five_hotspots_and_clones(tmp_path: Pa
     assert "### Deterministic Analysis Report" in prompt_compact
     assert len(prompt_compact) < len(prompt_100k)
 
+
+def test_ellipsis_and_name_leak_fake_guards_rejected(tmp_path: Path) -> None:
+    """Ellipsis no-ops and pass-throughs named verify_*/authorize_* must be flagged as fake."""
+    from indexer.permission_auditor import verify_helper_classification_ast
+
+    for bad_src in (
+        "def verify_webhook(sig: str) -> None:\n    ...\n",
+        "def verify_webhook(sig: str) -> int:\n    return 1\n",
+        "def authorize_user(user: str) -> None:\n    x = user\n",
+    ):
+        ok, reason = verify_helper_classification_ast(bad_src, "AUTH_GUARD")
+        assert ok is False, f"Expected AUTH_GUARD rejection for:\n{bad_src}"
+        assert reason != ""
+
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "guards.py").write_text(
+        "def verify_token(token: str) -> None:\n"
+        "    ...\n\n"
+        "def authorize_request(session: str) -> None:\n"
+        "    current = session\n",
+        encoding="utf-8",
+    )
+    report = analyze_repository(tmp_path)
+    false_claims = {
+        f.symbol_name for f in report.findings if f.category == "FALSE_SECURITY_CLAIM"
+    }
+    assert "verify_token" in false_claims
+    assert "authorize_request" in false_claims
+
+
+def test_fake_verify_signature_does_not_mask_same_function_guest_mutation(
+    tmp_path: Path,
+) -> None:
+    """Calling a fake `verify_signature` must not suppress same-function Guest DB mutation."""
+    app = tmp_path / "billing_app"
+    app.mkdir()
+    (app / "perms.py").write_text(
+        "def verify_signature(sig: str) -> bool:\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    (app / "api.py").write_text(
+        "from billing_app.perms import verify_signature\n\n"
+        "@frappe.whitelist(allow_guest=True)\n"
+        "def guest_pay(order_id: str, sig: str) -> None:\n"
+        '    """Admin only endpoint requiring authentication."""\n'
+        "    verify_signature(sig)\n"
+        "    frappe.db.set_value('Order', order_id, 'status', 'Paid')\n",
+        encoding="utf-8",
+    )
+
+    report = analyze_repository(tmp_path)
+    guest_pay_findings = [
+        (f.category, f.severity) for f in report.findings if f.symbol_name == "guest_pay"
+    ]
+    assert ("GUEST_PERMISSION", "HIGH") in guest_pay_findings
+    assert ("FALSE_SECURITY_CLAIM", "HIGH") in guest_pay_findings
+
+
+def test_generate_gemini_review_invokes_stage4_helper_classifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """generate_vertex_gemini_review classifies candidate_helpers and prunes guarded paths."""
+    from google import genai
+
+    from pr_bot.gemini_reviewer import generate_vertex_gemini_review
+
+    app = tmp_path / "shop"
+    app.mkdir()
+    (app / "db_ops.py").write_text(
+        "def force_write(name: str) -> None:\n"
+        "    frappe.db.set_value('Order', name, 'status', 'Paid')\n",
+        encoding="utf-8",
+    )
+    (app / "auth.py").write_text(
+        "from shop.db_ops import force_write\n\n"
+        "def custom_gate(payload: str, name: str) -> None:\n"
+        "    if not payload:\n"
+        "        raise ValueError('unauthorized')\n"
+        "    return force_write(name)\n",
+        encoding="utf-8",
+    )
+    (app / "api.py").write_text(
+        "from shop.auth import custom_gate\n\n"
+        "@frappe.whitelist(allow_guest=True)\n"
+        "def webhook(payload: str, name: str) -> None:\n"
+        "    return custom_gate(payload, name)\n",
+        encoding="utf-8",
+    )
+
+    report = analyze_repository(tmp_path)
+    assert len(report.candidate_helpers) == 1
+    assert len(report.witness_paths) == 1
+
+    prompts_seen: list[str] = []
+
+    class _FakeModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            contents = str(kwargs.get("contents", ""))
+            prompts_seen.append(contents)
+            if "Classify Python/Frappe helper" in contents:
+                return type(
+                    "Resp",
+                    (),
+                    {"text": '{"role": "AUTH_GUARD", "rationale": "raises on empty payload"}'},
+                )()
+            return type("Resp", (), {"text": "### Executive Risk Assessment\nClean."})()
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.models = _FakeModels()
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    review_out = generate_vertex_gemini_review(report)
+    assert "Executive Risk Assessment" in review_out
+    assert len(prompts_seen) == 2
+    # After Stage-4 classification, the guarded witness path is pruned from report & final prompt
+    assert report.witness_paths == []
+    assert "Unsanitized Source-to-Sink Witness Paths" not in prompts_seen[-1]
+

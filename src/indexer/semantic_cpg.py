@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections import deque
-from pathlib import Path
 from typing import Any
 
 import networkx as nx
@@ -104,11 +102,6 @@ class SemanticCPGBuilder:
             Language.PYTHON: Parser(TSLanguage(tree_sitter_python.language())),
             Language.JAVASCRIPT: Parser(TSLanguage(tree_sitter_javascript.language())),
         }
-
-    def ingest_scip_json(self, scip_path: str | Path) -> list[SCIPSymbolNode]:
-        """Ingest a JSON-encoded SCIP index payload into the CPG."""
-        payload = json.loads(Path(scip_path).read_text(encoding="utf-8"))
-        return self.ingest_scip_payload(payload)
 
     def ingest_scip_payload(self, payload: dict[str, Any]) -> list[SCIPSymbolNode]:
         """Ingest a decoded SCIP index dictionary (documents, occurrences, symbols)."""

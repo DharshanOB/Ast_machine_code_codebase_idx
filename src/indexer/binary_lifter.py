@@ -15,9 +15,9 @@ import capstone
 import lief
 
 from indexer.llvm_ir_pass import (
-    BUILD_TMP_ROOT,
     MAX_COMPILER_TIMEOUT_S,
     _apply_resource_limits,
+    get_build_tmp_root,
     resolve_clang_binary,
     sanitize_compile_flags,
 )
@@ -152,7 +152,7 @@ class BinaryLifter:
         self.clang_bin = resolve_clang_binary(clang_bin)
         self.rustc_bin = shutil.which("rustc")
         self._owned_tmp_dirs: list[Path] = []
-        BUILD_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        get_build_tmp_root().mkdir(parents=True, exist_ok=True)
 
     def cleanup(self) -> None:
         """Remove any temporary directories created by direct compile_to_object calls."""
@@ -183,7 +183,7 @@ class BinaryLifter:
         if out_obj_path is not None:
             target_path = Path(out_obj_path)
         else:
-            tmp_dir = Path(tempfile.mkdtemp(dir=BUILD_TMP_ROOT))
+            tmp_dir = Path(tempfile.mkdtemp(dir=get_build_tmp_root()))
             self._owned_tmp_dirs.append(tmp_dir)
             target_path = tmp_dir / f"{src.stem}.o"
         cmd = [
@@ -223,7 +223,7 @@ class BinaryLifter:
         if out_obj_path is not None:
             target_path = Path(out_obj_path)
         else:
-            tmp_dir = Path(tempfile.mkdtemp(dir=BUILD_TMP_ROOT))
+            tmp_dir = Path(tempfile.mkdtemp(dir=get_build_tmp_root()))
             self._owned_tmp_dirs.append(tmp_dir)
             target_path = tmp_dir / f"{src.stem}.o"
         cmd = [

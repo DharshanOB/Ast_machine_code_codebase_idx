@@ -10,6 +10,9 @@ from indexer.models import BinaryBasicBlock, LLVMIRGraph, ProGraMLEdge, ProGraML
 
 _MAX_PY_BYTES = 2_000_000
 _PY_NO_FALLTHROUGH = ("RETURN_VALUE", "RETURN_CONST", "RAISE_VARARGS", "RERAISE")
+_PY_UNCONDITIONAL_JUMPS = frozenset(
+    {"JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_BACKWARD_NO_INTERRUPT", "JUMP_ABSOLUTE"}
+)
 
 
 def _normalize_py_inst(inst: dis.Instruction) -> str:
@@ -60,7 +63,7 @@ def _build_code_cfg_and_blocks(
 
     for idx, inst in enumerate(insns):
         if idx + 1 < len(insns) and inst.opname not in _PY_NO_FALLTHROUGH:
-            if not inst.opname.startswith("JUMP_"):
+            if inst.opname not in _PY_UNCONDITIONAL_JUMPS:
                 edges.append(ProGraMLEdge(source=idx, target=idx + 1, flow_type="ctrl"))
         if ("JUMP" in inst.opname or inst.opname == "FOR_ITER") and isinstance(inst.argval, int):
             target_idx = offset_to_idx.get(inst.argval)
@@ -118,7 +121,7 @@ def _build_code_cfg_and_blocks(
                 succs.append(inst.argval)
             if (
                 inst.opname not in _PY_NO_FALLTHROUGH
-                and not inst.opname.startswith("JUMP_")
+                and inst.opname not in _PY_UNCONDITIONAL_JUMPS
                 and idx + 1 < len(insns)
             ):
                 succs.append(insns[idx + 1].offset)
