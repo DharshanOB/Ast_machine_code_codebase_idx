@@ -38,6 +38,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compile-commands", default=None, help="Optional compile_commands.json.")
     parser.add_argument("--out-md", default="pr_review_summary.md", help="Output Markdown path.")
     parser.add_argument(
+        "--out-deterministic-md",
+        default=None,
+        help="Optional output path for the deterministic 4-layer Markdown report only.",
+    )
+    parser.add_argument(
+        "--out-gemini-md",
+        default=None,
+        help="Optional output path for the standalone detailed Gemini Markdown report.",
+    )
+    parser.add_argument(
         "--out-comments",
         default=None,
         help="Output inline comments JSON (defaults to pr_review_comments.json in pr mode).",
@@ -111,7 +121,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             diff_text = diff_proc.stdout
 
-    markdown = report.to_markdown()
+    deterministic_md = report.to_markdown()
+    markdown = deterministic_md
+    gemini_md = (
+        f"# Gemini Detailed Code Review ({args.gemini_model})\n\n"
+        "> **Note:** AI review unavailable (no Vertex project or Gemini API key configured).\n"
+    )
     has_api_key = bool(
         os.environ.get("VERTEX_API_KEY")
         or os.environ.get("GEMINI_API_KEY")
@@ -131,20 +146,30 @@ def main(argv: list[str] | None = None) -> int:
             logger.warning(
                 "Gemini review generation failed (%s); writing deterministic report", exc
             )
-            markdown = (
-                f"{markdown}\n> **Note:** AI review unavailable "
+            note = (
+                f"> **Note:** AI review unavailable "
                 f"(`{type(exc).__name__}`); deterministic 4-layer report emitted.\n"
             )
+            markdown = f"{markdown}\n{note}"
+            gemini_md = f"# Gemini Detailed Code Review ({args.gemini_model})\n\n{note}"
         else:
             if ai_review:
                 verified_review, _ = verify_review_claims(ai_review, report)
-                markdown = report.to_markdown()
+                deterministic_md = report.to_markdown()
+                gemini_md = (
+                    f"# Gemini Detailed Code Review ({args.gemini_model})\n\n"
+                    f"{verified_review}\n"
+                )
                 markdown = (
                     f"### Gemini Review ({args.gemini_model})\n\n"
-                    f"{verified_review}\n\n---\n\n{markdown}"
+                    f"{verified_review}\n\n---\n\n{deterministic_md}"
                 )
 
     Path(args.out_md).write_text(markdown, encoding="utf-8")
+    if args.out_deterministic_md:
+        Path(args.out_deterministic_md).write_text(deterministic_md, encoding="utf-8")
+    if args.out_gemini_md:
+        Path(args.out_gemini_md).write_text(gemini_md, encoding="utf-8")
     comments_out: str | None = (
         args.out_comments
         if args.mode == "repo"

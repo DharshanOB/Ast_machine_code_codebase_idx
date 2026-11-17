@@ -23,22 +23,26 @@ _PR_SYSTEM_INSTRUCTION = (
     "You are Astraea, a senior systems, Frappe, & security code reviewer. You are given up to "
     "100k tokens of deterministic 4-layer analysis (AST complexity, SCIP/CPG blast radius, LLVM "
     "SSA IR similarity, machine-code basic blocks, witness paths, and permission checks) "
-    "alongside git diff context. Be concise and never repeat tables already in the report. "
-    "Emit actionable items with exact `file:line` citations for every security finding, guest "
-    "escalation path, bypass (`ignore_permissions`, `get_all`), SQL injection, or lowering "
-    "regression you inspect. Never speculate about uninspected code."
+    "alongside git diff context. Write a thorough, detailed standalone PR review report "
+    "suitable for engineering sign-off. For EVERY finding, hotspot, witness path, or regression "
+    "you inspect, explain the root cause, execution/data-flow path, impact, exact `file:line` "
+    "citations, and concrete remediation steps or patch guidance. Cover all inspected security "
+    "flaws, guest-escalation paths, bypasses (`ignore_permissions`, `get_all`), SQL injection, "
+    "`has_permission` hook flaws, and lowering regressions. Never speculate about uninspected code."
     + _UNTRUSTED_DATA_RULE
 )
 
 _REPO_SYSTEM_INSTRUCTION = (
     "You are Astraea, a senior software, Frappe, & security code reviewer performing a "
-    "full-context repo audit (up to 100k tokens). You are given deterministic AST complexity, "
-    "cross-file CPG blast radius, permission inventory (including Frappe DocType Guest/All "
-    "roles, witness paths, and `allow_guest`/`ignore_permissions`), semantic clone clusters, and "
-    "source code for top hotspot functions. Avoid repeating raw tables already emitted, and "
-    "produce a complete multi-tier refactoring plan covering every inspected high-complexity "
-    "hotspot, security/permission flaw, and clone cluster (do not artificially stop at 3 items). "
-    "Cite exact `file:line` locations and do NOT speculate about code you have not seen."
+    "deep full-context repository audit (up to 100k tokens). You are given deterministic AST "
+    "complexity, cross-file CPG blast radius, permission inventory (including Frappe DocType "
+    "Guest/All roles, witness paths, and `allow_guest`/`ignore_permissions`), semantic clone "
+    "clusters, and source code for top hotspot functions. Write a comprehensive, detailed "
+    "standalone audit report. For every inspected vulnerability, permission flaw, witness path, "
+    "complexity hotspot, and clone cluster, provide deep root-cause analysis, concrete attack or "
+    "failure scenarios, exact `file:line` citations, and specific code-level refactoring/fix "
+    "designs across P0/P1/P2 (do not artificially stop at 3 items). Distinguish confirmed bugs "
+    "from static false positives, and do NOT speculate about code you have not seen."
     + _UNTRUSTED_DATA_RULE
 )
 
@@ -235,20 +239,35 @@ def build_review_prompt(
     if _uses_compiler_lowering(report, diff_text):
         sections.append(
             "Provide:\n"
-            "1. **Executive Risk Assessment** (blast radius, hotspots & lowering deltas/NFC)\n"
-            "2. **Correctness, Security & Performance Observations** (cite exact `file:line`)\n"
-            "3. **Actionable Recommendations & Refactorings** "
-            "(cover every inspected security flaw, permission risk, and regression)\n"
+            "Write a detailed standalone technical review covering:\n"
+            "1. **Executive Risk Assessment** "
+            "(overall merge risk, blast radius, hotspots, and IR/NFC deltas)\n"
+            "2. **Detailed Security & Permission Analysis** "
+            "(root cause, exploit/escalation path across witness paths, `allow_guest`, "
+            "`ignore_permissions`, SQLi, and `has_permission` hooks with exact `file:line` "
+            "citations)\n"
+            "3. **Detailed Code Quality, Lowering & Architecture Findings** "
+            "(function-by-function review of touched code, compiler/bytecode lowering "
+            "regressions, CPG callers/callees impact, and edge cases)\n"
+            "4. **Concrete Remediation & Patch Guidance** "
+            "(specific code fixes, guard helpers, and tests for every finding)\n"
         )
     else:
         sections.append(
             "Provide:\n"
-            "1. **Executive Risk Assessment** (top hotspots, security risks & deltas)\n"
-            "2. **Concrete Code Review Findings** (cite exact lines from Top Hotspot Source Code)\n"
-            "3. **Prioritized Refactoring & Clone-Consolidation Plan** "
-            "(cover ALL inspected hotspots, security/permission flaws, and clone clusters across "
-            "P0 Security, P1 Complexity/Decomposition, and P2 Clone Consolidation—not limited to "
-            "3 items)\n"
+            "Write a detailed standalone technical audit report covering:\n"
+            "1. **Executive Risk Assessment** "
+            "(overall posture, top hotspots, security risks & baseline deltas)\n"
+            "2. **Detailed Security & Privilege Walkthrough** "
+            "(deep root-cause analysis, concrete attack scenarios, and triage of false "
+            "positives vs real risks for every inspected SQLi, guest endpoint, witness path, "
+            "bypass, and `has_permission` hook with exact `file:line` citations)\n"
+            "3. **Detailed Complexity, Concurrency & Blast-Radius Findings** "
+            "(per-hotspot analysis from Top Hotspot Source Code covering branching, "
+            "transaction atomicity, and caller impact)\n"
+            "4. **Complete Multi-Tier Refactoring & Clone-Consolidation Plan** "
+            "(exhaustive P0 Security, P1 Complexity/Decomposition, and P2 Clone Consolidation "
+            "items with concrete helper/module designs—not limited to 3 items)\n"
         )
     return "\n\n".join(sections)
 

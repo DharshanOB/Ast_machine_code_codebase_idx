@@ -579,3 +579,90 @@ def test_clone_clusters_include_avg_similarity_in_prompt(tmp_path: Path) -> None
     assert report.clone_clusters[0].get("avg_similarity", 0.0) >= 0.80
     prompt = build_review_prompt(report)
     assert "avg similarity 0.000" not in prompt
+
+
+def test_cli_outputs_separate_deterministic_and_detailed_gemini_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI must support separate deterministic and standalone detailed Gemini report files."""
+    from google import genai
+
+    captured_configs: list[Any] = []
+
+    class _FakeModels:
+        def generate_content(self, **kwargs: Any) -> Any:
+            captured_configs.append(kwargs.get("config"))
+            return type(
+                "Resp",
+                (),
+                {
+                    "text": (
+                        "### 1. Executive Risk Assessment\n"
+                        "Detailed findings for `app.py:1` (`alpha`)."
+                    )
+                },
+            )()
+
+    class _FakeClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.models = _FakeModels()
+
+    monkeypatch.setattr(genai, "Client", _FakeClient)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("def alpha(x: int) -> int:\n    return x + 1\n", encoding="utf-8")
+
+    out_md = tmp_path / "combined.md"
+    out_det = tmp_path / "deterministic.md"
+    out_gemini = tmp_path / "gemini_detailed.md"
+
+    rc = cli_main(
+        [
+            "--mode",
+            "repo",
+            "--repo",
+            str(repo),
+            "--out-md",
+            str(out_md),
+            "--out-deterministic-md",
+            str(out_det),
+            "--out-gemini-md",
+            str(out_gemini),
+        ]
+    )
+    assert rc == 0
+    assert out_md.exists()
+    assert out_det.exists()
+    assert out_gemini.exists()
+
+    combined_text = out_md.read_text(encoding="utf-8")
+    det_text = out_det.read_text(encoding="utf-8")
+    gemini_text = out_gemini.read_text(encoding="utf-8")
+
+    assert "Gemini Review" in combined_text
+    assert "Astraea Periodic Repository Review" in combined_text
+    assert "Gemini Review" not in det_text
+    assert "Astraea Periodic Repository Review" in det_text
+    assert "Detailed findings for `app.py:1`" in gemini_text
+    assert "Astraea Periodic Repository Review" not in gemini_text
+    assert captured_configs and getattr(captured_configs[-1], "max_output_tokens", None) is None
+
+    # When no Gemini credentials are set, --out-gemini-md still emits an informative status note.
+    monkeypatch.delenv("GEMINI_API_KEY")
+    out_gemini_no_key = tmp_path / "gemini_no_key.md"
+    rc_no_key = cli_main(
+        [
+            "--mode",
+            "repo",
+            "--repo",
+            str(repo),
+            "--out-md",
+            str(out_md),
+            "--out-gemini-md",
+            str(out_gemini_no_key),
+        ]
+    )
+    assert rc_no_key == 0
+    assert "unavailable" in out_gemini_no_key.read_text(encoding="utf-8").lower()
